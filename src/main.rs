@@ -11,8 +11,9 @@ use crate::document::AudioDocument;
 use crate::dsp::{
     apply_3band_eq, apply_delay_echo, apply_gain_db, apply_reverb, auto_trim_crop,
     change_speed_range_with_algo, concat_with_crossfade, convert_channels, delete_range,
-    extend_range_with_crossfade, fade_in, fade_out, graphic_fade, insert_buffer, insert_silence,
-    invert_flip_range, mix_buffer, normalize_audio, pan_expand_range, pitch_shift_range_ex,
+    extend_range_with_crossfade, fade_in, fade_out, graphic_fade, insert_buffer,
+    insert_buffer_with_crossfade, insert_silence, invert_flip_range, mix_buffer,
+    mix_buffer_advanced, normalize_audio, pan_expand_range, pitch_shift_range_ex,
     remove_dc_offset, resample_to_rate, reverse_range, rotate_audio_range, silence_range,
     slice_frames, smooth_enhance_range, ChannelConvertMode, FadeCurve, SpeedMode,
     TimeStretchAlgorithm,
@@ -110,6 +111,7 @@ struct ForgeApp {
     playing_doc_idx: Option<usize>,
     next_doc_id: usize,
     clipboard: Option<AudioBuffer>,
+    clipboard_source_title: String,
     playback: PlaybackEngine,
     interaction: WaveformInteraction,
 
@@ -184,9 +186,16 @@ struct ForgeApp {
     dlg_silence_secs: f64,
 
     // Multi-song transfer & join
+    dlg_use_clipboard_source: bool,
+    dlg_src_doc_idx: usize,
     dlg_target_doc_idx: usize,
-    dlg_transfer_mode: usize, // 0 = Insert at Target Cursor, 1 = Append at End with Crossfade, 2 = Mix at Target Cursor
+    dlg_dst_pos_mode: usize, // 0 = Cursor, 1 = End of Song, 2 = Start of Song, 3 = Replace Selection
+    dlg_transfer_mode: usize, // 0 = Insert, 1 = Insert with Crossfade, 2 = Mix / Overlay
     dlg_join_xfade_secs: f64,
+    dlg_mix_clip_gain_pct: f32,
+    dlg_mix_dst_gain_pct: f32,
+    dlg_mix_fade_in_s: f64,
+    dlg_mix_fade_out_s: f64,
 
     // Export
     dlg_export_format: ExportFormat,
@@ -219,6 +228,7 @@ impl ForgeApp {
             playing_doc_idx: None,
             next_doc_id: 1,
             clipboard: None,
+            clipboard_source_title: String::new(),
             playback: PlaybackEngine::new(),
             interaction: WaveformInteraction::default(),
             loop_enabled: false,
@@ -263,9 +273,16 @@ impl ForgeApp {
             dlg_extend_secs: 2.5,
             dlg_extend_xfade_ms: 25.0,
             dlg_silence_secs: 1.0,
+            dlg_use_clipboard_source: false,
+            dlg_src_doc_idx: 0,
             dlg_target_doc_idx: 0,
+            dlg_dst_pos_mode: 0,
             dlg_transfer_mode: 0,
-            dlg_join_xfade_secs: 1.5,
+            dlg_join_xfade_secs: 1.2,
+            dlg_mix_clip_gain_pct: 100.0,
+            dlg_mix_dst_gain_pct: 85.0,
+            dlg_mix_fade_in_s: 0.15,
+            dlg_mix_fade_out_s: 0.15,
             dlg_export_format: ExportFormat::Wav24,
             dlg_export_sr: None,
             show_markers_panel: false,
@@ -558,41 +575,69 @@ impl ForgeApp {
             self.status_msg = "Selecione um trecho antes de Recortar.".to_string();
             return;
         };
+        let title = doc.title.clone();
+        let secs = doc.buffer.frame_to_secs(e - s);
         let cut_clip = slice_frames(&doc.buffer, s, e);
         let next_buf = delete_range(&doc.buffer, s, e);
         doc.annotations.adjust_for_edit(s, e, 0);
         doc.commit_buffer(next_buf, s, None);
         self.clipboard = Some(cut_clip);
-        self.status_msg = "Trecho recortado para a área de transferência.".to_string();
+        self.clipboard_source_title = title.clone();
+        self.status_msg = format!(
+            "Recortado de '{title}' ({}). Clique em outra janela e use [📌 Colar Aqui] ou [🔀 Mesclar Aqui...]!",
+            format_timecode(secs)
+        );
     }
 
     fn action_copy(&mut self) {
         let Some(doc) = self.active_doc() else {
             return;
         };
-        let Some((s, e)) = doc.selection else {
-            self.status_msg = "Selecione um trecho antes de Copiar.".to_string();
-            return;
+        let (s, e, is_full) = if let Some((s, e)) = doc.selection {
+            if e > s {
+                (s, e, false)
+            } else {
+                (0, doc.buffer.num_frames(), true)
+            }
+        } else {
+            (0, doc.buffer.num_frames(), true)
         };
+        if e <= s {
+            self.status_msg = "A janela ativa está vazia.".to_string();
+            return;
+        }
         let copied = slice_frames(&doc.buffer, s, e);
         let secs = doc.buffer.frame_to_secs(e - s);
         let title = doc.title.clone();
         self.clipboard = Some(copied);
+        self.clipboard_source_title = title.clone();
+        let kind = if is_full {
+            "Música inteira copiada"
+        } else {
+            "Trecho copiado"
+        };
         self.status_msg = format!(
-            "Copiado de '{title}': {} (você pode clicar em outra música e teclar Ctrl+V!).",
+            "{kind} de '{title}' ({})! Clique na outra janela e use [📌 Colar Aqui], [🔗 Colar c/ Crossfade] ou [🔀 Mesclar Aqui...]!",
             format_timecode(secs)
         );
     }
 
     fn action_paste(&mut self) {
         let Some(clip) = self.clipboard.clone() else {
-            self.status_msg = "Área de transferência vazia.".to_string();
+            self.status_msg = "Área de transferência vazia — copie um trecho (Ctrl+C) primeiro."
+                .to_string();
             return;
         };
         self.stop_playback();
+        let src_name = if self.clipboard_source_title.is_empty() {
+            "Área de Transferência".to_string()
+        } else {
+            self.clipboard_source_title.clone()
+        };
         let Some(doc) = self.active_doc_mut() else {
             return;
         };
+        let dst_title = doc.title.clone();
         let (ins_at, base_buf) = if let Some((s, e)) = doc.selection {
             doc.annotations.adjust_for_edit(s, e, 0);
             (s, delete_range(&doc.buffer, s, e))
@@ -603,22 +648,76 @@ impl ForgeApp {
         let added = next_buf.num_frames().saturating_sub(base_buf.num_frames());
         doc.annotations.adjust_for_edit(ins_at, ins_at, added);
         doc.commit_buffer(next_buf, ins_at + added, Some((ins_at, ins_at + added)));
-        self.status_msg = "Trecho colado na música ativa.".to_string();
+        self.status_msg = format!(
+            "Colado trecho de '{src_name}' em '{dst_title}' na posição {}.",
+            format_timecode(doc.buffer.frame_to_secs(ins_at))
+        );
+    }
+
+    fn action_paste_crossfade(&mut self) {
+        let Some(clip) = self.clipboard.clone() else {
+            self.status_msg = "Área de transferência vazia — copie um trecho (Ctrl+C) primeiro."
+                .to_string();
+            return;
+        };
+        self.stop_playback();
+        let xfade_s = self.dlg_join_xfade_secs.clamp(0.05, 5.0);
+        let src_name = if self.clipboard_source_title.is_empty() {
+            "Área de Transferência".to_string()
+        } else {
+            self.clipboard_source_title.clone()
+        };
+        let Some(doc) = self.active_doc_mut() else {
+            return;
+        };
+        let dst_title = doc.title.clone();
+        let (ins_at, base_buf) = if let Some((s, e)) = doc.selection {
+            doc.annotations.adjust_for_edit(s, e, 0);
+            (s, delete_range(&doc.buffer, s, e))
+        } else {
+            (doc.cursor_frame, (*doc.buffer).clone())
+        };
+        let next_buf = insert_buffer_with_crossfade(&base_buf, ins_at, &clip, xfade_s);
+        let added = next_buf.num_frames().saturating_sub(base_buf.num_frames());
+        doc.annotations.adjust_for_edit(ins_at, ins_at, added);
+        let end_sel = (ins_at + added.max(1)).min(next_buf.num_frames());
+        doc.commit_buffer(next_buf, end_sel, Some((ins_at, end_sel)));
+        self.status_msg = format!(
+            "Colado com Crossfade suave ({xfade_s:.2}s) de '{src_name}' em '{dst_title}'!",
+        );
     }
 
     fn action_paste_mix(&mut self) {
         let Some(clip) = self.clipboard.clone() else {
-            self.status_msg = "Área de transferência vazia.".to_string();
+            self.status_msg = "Área de transferência vazia — copie um trecho (Ctrl+C) primeiro."
+                .to_string();
             return;
         };
         self.stop_playback();
+        let dst_gain = (self.dlg_mix_dst_gain_pct / 100.0).clamp(0.0, 2.0);
+        let clip_gain = (self.dlg_mix_clip_gain_pct / 100.0).clamp(0.0, 2.0);
+        let fi = self.dlg_mix_fade_in_s.max(0.0);
+        let fo = self.dlg_mix_fade_out_s.max(0.0);
+        let src_name = if self.clipboard_source_title.is_empty() {
+            "Área de Transferência".to_string()
+        } else {
+            self.clipboard_source_title.clone()
+        };
         let Some(doc) = self.active_doc_mut() else {
             return;
         };
-        let at = doc.cursor_frame;
-        let next_buf = mix_buffer(&doc.buffer, at, &clip, 0.85);
-        doc.commit_buffer(next_buf, at, doc.selection);
-        self.status_msg = "Mixagem aplicada na posição do cursor.".to_string();
+        let dst_title = doc.title.clone();
+        let at = doc.selection.map(|(s, _)| s).unwrap_or(doc.cursor_frame);
+        let next_buf = mix_buffer_advanced(&doc.buffer, at, &clip, dst_gain, clip_gain, fi, fo);
+        let clip_frames_in_dst = ((clip.duration_secs() * doc.buffer.sample_rate as f64).round()
+            as usize)
+            .max(1);
+        let end_sel = (at + clip_frames_in_dst).min(next_buf.num_frames());
+        doc.commit_buffer(next_buf, at, Some((at, end_sel)));
+        self.status_msg = format!(
+            "Mesclado (Mix) trecho de '{src_name}' sobre '{dst_title}' em {}!",
+            format_timecode(doc.buffer.frame_to_secs(at))
+        );
     }
 
     fn action_delete(&mut self) {
@@ -879,15 +978,32 @@ impl eframe::App for ForgeApp {
                         self.action_copy();
                         ui.close_menu();
                     }
-                    if ui.button("Paste (Ctrl+V)").clicked() {
+                    if ui.button("Paste / Inserir no Cursor (Ctrl+V)").clicked() {
                         self.action_paste();
                         ui.close_menu();
                     }
-                    if ui.button("Paste Special -> Mix (Ctrl+M)").clicked() {
+                    if ui.button("Paste Special -> Colar com Crossfade Suave").clicked() {
+                        self.action_paste_crossfade();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Paste Special -> Mix / Mesclar Rápido (Ctrl+M)")
+                        .clicked()
+                    {
                         self.action_paste_mix();
                         ui.close_menu();
                     }
-                    if ui.button("Send Selection to Another Open Song...").clicked() {
+                    if ui
+                        .button("Paste Special -> Mesclar / Transferir Entre Janelas...")
+                        .clicked()
+                    {
+                        self.dlg_src_doc_idx = self.active_tab;
+                        self.dlg_target_doc_idx = if self.docs.len() > 1 {
+                            (self.active_tab + 1) % self.docs.len()
+                        } else {
+                            self.active_tab
+                        };
+                        self.dlg_use_clipboard_source = self.clipboard.is_some();
                         self.dialog = ActiveDialog::SendToOtherDoc;
                         ui.close_menu();
                     }
@@ -1334,21 +1450,56 @@ impl eframe::App for ForgeApp {
                     self.dialog = ActiveDialog::Export;
                 }
                 ui.separator();
-                if ui.button("✂").on_hover_text("Cut (Ctrl+X)").clicked() {
+                if ui
+                    .button("✂ Recortar")
+                    .on_hover_text("Recortar trecho selecionado para colar em outra janela (Ctrl+X)")
+                    .clicked()
+                {
                     self.action_cut();
                 }
-                if ui.button("📋").on_hover_text("Copy (Ctrl+C)").clicked() {
+                if ui
+                    .button("📋 Copiar")
+                    .on_hover_text("Copiar trecho selecionado (ou música inteira) desta janela (Ctrl+C)")
+                    .clicked()
+                {
                     self.action_copy();
                 }
-                if ui.button("📌").on_hover_text("Paste (Ctrl+V)").clicked() {
+                if ui
+                    .button("📌 Colar")
+                    .on_hover_text("Colar / Inserir trecho copiado no cursor da janela ativa (Ctrl+V)")
+                    .clicked()
+                {
                     self.action_paste();
                 }
                 if ui
-                    .button("🔀 Mix")
-                    .on_hover_text("Paste Mix (Ctrl+M)")
+                    .button("🔗 Colar c/ Crossfade")
+                    .on_hover_text("Inserir trecho copiado no cursor da janela ativa com Crossfade suave nas bordas")
+                    .clicked()
+                {
+                    self.action_paste_crossfade();
+                }
+                if ui
+                    .button("🔀 Mesclar (Mix)")
+                    .on_hover_text("Mesclar / Sobrepor trecho copiado sobre a música na posição do cursor (Ctrl+M)")
                     .clicked()
                 {
                     self.action_paste_mix();
+                }
+                if self.docs.len() >= 2 || self.clipboard.is_some() {
+                    if ui
+                        .button("📥 Entre Janelas...")
+                        .on_hover_text("Abrir painel completo para Copiar, Colar, Emendar c/ Crossfade ou Mesclar entre qualquer janela aberta")
+                        .clicked()
+                    {
+                        self.dlg_src_doc_idx = self.active_tab;
+                        self.dlg_target_doc_idx = if self.docs.len() > 1 {
+                            (self.active_tab + 1) % self.docs.len()
+                        } else {
+                            self.active_tab
+                        };
+                        self.dlg_use_clipboard_source = self.clipboard.is_some();
+                        self.dialog = ActiveDialog::SendToOtherDoc;
+                    }
                 }
                 if ui
                     .button("🔪 Trim")
@@ -1665,6 +1816,49 @@ impl eframe::App for ForgeApp {
 
                 let num_docs = self.docs.len();
                 let has_multi = num_docs > 1;
+                let has_clip = self.clipboard.is_some();
+                if let Some(clip) = &self.clipboard {
+                    let clip_dur = format_timecode(clip.duration_secs());
+                    let src_lbl = if self.clipboard_source_title.is_empty() {
+                        "Trecho copiado".to_string()
+                    } else {
+                        self.clipboard_source_title.clone()
+                    };
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(225, 236, 250))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 125, 195)))
+                        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                        .rounding(2.0)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "📋 Área de Transferência pronta: '{src_lbl}' ({clip_dur}) — Clique no ponto desejado de qualquer janela abaixo e escolha:"
+                                    ))
+                                    .size(11.5)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(20, 50, 95)),
+                                );
+                                if ui.small_button("📌 Colar na Ativa (Ctrl+V)").clicked() {
+                                    self.action_paste();
+                                }
+                                if ui.small_button("🔗 Colar c/ Crossfade").clicked() {
+                                    self.action_paste_crossfade();
+                                }
+                                if ui.small_button("🔀 Mesclar Rápido (Ctrl+M)").clicked() {
+                                    self.action_paste_mix();
+                                }
+                                if ui.small_button("🎛 Painel de Mesclagem / Opções...").clicked() {
+                                    self.dlg_use_clipboard_source = true;
+                                    self.dlg_target_doc_idx = self.active_tab;
+                                    self.dlg_transfer_mode = 2;
+                                    self.dialog = ActiveDialog::SendToOtherDoc;
+                                }
+                            });
+                        });
+                    ui.add_space(3.0);
+                }
+
                 let avail_h = ui.available_height().max(220.0);
                 let is_playing = self.playback.is_playing();
                 let cur_play_frame = if is_playing {
@@ -1689,6 +1883,7 @@ impl eframe::App for ForgeApp {
                                     is_active,
                                     false,
                                     has_multi,
+                                    has_clip,
                                     None, // Uses each window's independent resizable `doc.win_height`!
                                     &mut self.interaction,
                                     pf,
@@ -1725,6 +1920,7 @@ impl eframe::App for ForgeApp {
                                     is_active,
                                     false,
                                     has_multi,
+                                    has_clip,
                                     Some(avail_h - 8.0),
                                     &mut self.interaction,
                                     pf,
@@ -1765,6 +1961,7 @@ impl eframe::App for ForgeApp {
                             true,
                             true,
                             has_multi,
+                            has_clip,
                             Some(avail_h - 32.0),
                             &mut self.interaction,
                             pf,
@@ -1840,7 +2037,34 @@ impl eframe::App for ForgeApp {
                             self.docs.remove(idx);
                             self.active_tab = self.active_tab.min(self.docs.len().saturating_sub(1));
                         }
+                        DocWindowAction::CopySelection => {
+                            self.action_copy();
+                        }
+                        DocWindowAction::CutSelection => {
+                            self.action_cut();
+                        }
+                        DocWindowAction::PasteInsertHere => {
+                            self.action_paste();
+                        }
+                        DocWindowAction::PasteCrossfadeHere => {
+                            self.action_paste_crossfade();
+                        }
+                        DocWindowAction::PasteMixHere => {
+                            self.dlg_use_clipboard_source = true;
+                            self.dlg_target_doc_idx = idx;
+                            self.dlg_dst_pos_mode = 0;
+                            self.dlg_transfer_mode = 2; // Mix/Overlay mode
+                            self.dialog = ActiveDialog::SendToOtherDoc;
+                        }
+                        DocWindowAction::DeleteSelection => {
+                            self.action_delete();
+                        }
+                        DocWindowAction::TrimCropSelection => {
+                            self.action_trim_crop();
+                        }
                         DocWindowAction::SendSelectionToOtherDoc => {
+                            self.dlg_use_clipboard_source = false;
+                            self.dlg_src_doc_idx = idx;
                             self.dlg_target_doc_idx = (idx + 1) % self.docs.len().max(1);
                             self.dialog = ActiveDialog::SendToOtherDoc;
                         }
@@ -3021,98 +3245,390 @@ impl ForgeApp {
                 }
             }
 
-            // Send Selection to Another Open Song (`Como colocar varias musicas funciona`)
+            // Send Selection / Clipboard to Another Open Song (`Copiar, Colar e Mesclar Trechos Entre Janelas`)
             ActiveDialog::SendToOtherDoc => {
                 let mut open = true;
-                egui::Window::new("Transferir / Colar Trecho em Outra Música Aberta")
+                egui::Window::new("Copiar / Colar / Mesclar Trecho Entre Janelas")
                     .open(&mut open)
                     .resizable(false)
+                    .fixed_size([525.0, 410.0])
                     .show(ctx, |ui| {
-                        if self.docs.len() < 2 {
-                            ui.label("Abra pelo menos 2 músicas (Ctrl+O) para transferir trechos entre elas.");
+                        ui.set_max_width(515.0);
+                        if self.docs.is_empty() {
+                            ui.label("Abra pelo menos uma música (Ctrl+O) para colar ou mesclar trechos.");
                             return;
                         }
-                        ui.label(format!("Origem: {}", doc_title));
-                        ui.horizontal(|ui| {
-                            ui.label("Música de Destino:");
-                            let dst_idx = self.dlg_target_doc_idx.min(self.docs.len() - 1);
-                            egui::ComboBox::from_id_salt("dst_doc_combo")
-                                .selected_text(&self.docs[dst_idx].title)
-                                .show_ui(ui, |ui| {
-                                    for (i, d) in self.docs.iter().enumerate() {
-                                        if i != self.active_tab {
-                                            ui.selectable_value(
-                                                &mut self.dlg_target_doc_idx,
-                                                i,
-                                                format!("{}. {}", i + 1, d.title),
-                                            );
-                                        }
-                                    }
+
+                        // 1. Source Selection (Clipboard or Open Window)
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new("1. Origem do Trecho de Áudio:").strong());
+                                let has_clip = self.clipboard.is_some();
+                                if has_clip {
+                                    let clip_dur = self
+                                        .clipboard
+                                        .as_ref()
+                                        .map(|c| format_timecode(c.duration_secs()))
+                                        .unwrap_or_default();
+                                    let clip_src = if self.clipboard_source_title.is_empty() {
+                                        "Trecho Copiado".to_string()
+                                    } else {
+                                        self.clipboard_source_title.clone()
+                                    };
+                                    ui.radio_value(
+                                        &mut self.dlg_use_clipboard_source,
+                                        true,
+                                        format!("📋 Área de Transferência: '{clip_src}' ({clip_dur})"),
+                                    );
+                                } else {
+                                    self.dlg_use_clipboard_source = false;
+                                }
+
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(
+                                        &mut self.dlg_use_clipboard_source,
+                                        false,
+                                        "🎶 Janela Aberta:",
+                                    );
+                                    let src_idx = self.dlg_src_doc_idx.min(self.docs.len() - 1);
+                                    let (s0, e0) = self.docs[src_idx].target_range();
+                                    let src_dur = format_timecode(
+                                        self.docs[src_idx].buffer.frame_to_secs(e0.saturating_sub(s0)),
+                                    );
+                                    let src_tag = if self.docs[src_idx].selection.is_some() {
+                                        "Seleção"
+                                    } else {
+                                        "Música Inteira"
+                                    };
+                                    egui::ComboBox::from_id_salt("src_doc_combo")
+                                        .width(280.0)
+                                        .selected_text(format!(
+                                            "{}. {} ({src_tag}: {src_dur})",
+                                            src_idx + 1,
+                                            self.docs[src_idx].title
+                                        ))
+                                        .show_ui(ui, |ui| {
+                                            for (i, d) in self.docs.iter().enumerate() {
+                                                let (s, e) = d.target_range();
+                                                let dur = format_timecode(
+                                                    d.buffer.frame_to_secs(e.saturating_sub(s)),
+                                                );
+                                                let tag = if d.selection.is_some() {
+                                                    "Seleção"
+                                                } else {
+                                                    "Inteira"
+                                                };
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.dlg_src_doc_idx,
+                                                        i,
+                                                        format!("{}. {} ({tag}: {dur})", i + 1, d.title),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.dlg_use_clipboard_source = false;
+                                                }
+                                            }
+                                        });
                                 });
+                            });
                         });
 
-                        ui.separator();
-                        ui.radio_value(
-                            &mut self.dlg_transfer_mode,
-                            0,
-                            "Inserir exatamente na posição do cursor da música de destino",
-                        );
-                        ui.radio_value(
-                            &mut self.dlg_transfer_mode,
-                            1,
-                            "Juntar no final da música de destino com Crossfade suave",
-                        );
-                        ui.radio_value(
-                            &mut self.dlg_transfer_mode,
-                            2,
-                            "Mixar (sobrepor) na posição do cursor da música de destino",
-                        );
+                        ui.add_space(4.0);
 
-                        if self.dlg_transfer_mode == 1 {
-                            ui.horizontal(|ui| {
-                                ui.label("Crossfade (s):");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.dlg_join_xfade_secs)
-                                        .speed(0.1)
-                                        .range(0.0..=15.0)
-                                        .suffix(" s"),
-                                );
+                        // 2. Destination Window & Position
+                        let dst_idx = self.dlg_target_doc_idx.min(self.docs.len() - 1);
+                        let dst_cursor_tc = format_timecode(
+                            self.docs[dst_idx]
+                                .buffer
+                                .frame_to_secs(self.docs[dst_idx].cursor_frame),
+                        );
+                        let dst_end_tc =
+                            format_timecode(self.docs[dst_idx].buffer.duration_secs());
+                        let dst_has_sel = self.docs[dst_idx].selection.is_some();
+
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("2. Janela de Destino:").strong(),
+                                    );
+                                    egui::ComboBox::from_id_salt("dst_doc_combo")
+                                        .width(310.0)
+                                        .selected_text(format!(
+                                            "{}. {} (Cursor: {dst_cursor_tc})",
+                                            dst_idx + 1,
+                                            self.docs[dst_idx].title
+                                        ))
+                                        .show_ui(ui, |ui| {
+                                            for (i, d) in self.docs.iter().enumerate() {
+                                                let cur_tc = format_timecode(
+                                                    d.buffer.frame_to_secs(d.cursor_frame),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut self.dlg_target_doc_idx,
+                                                    i,
+                                                    format!(
+                                                        "{}. {} (Cursor: {cur_tc})",
+                                                        i + 1,
+                                                        d.title
+                                                    ),
+                                                );
+                                            }
+                                        });
+                                });
+
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Onde aplicar:");
+                                    ui.radio_value(
+                                        &mut self.dlg_dst_pos_mode,
+                                        0,
+                                        format!("No Cursor ({dst_cursor_tc})"),
+                                    );
+                                    ui.radio_value(
+                                        &mut self.dlg_dst_pos_mode,
+                                        1,
+                                        format!("No Final ({dst_end_tc})"),
+                                    );
+                                    ui.radio_value(
+                                        &mut self.dlg_dst_pos_mode,
+                                        2,
+                                        "No Início (00:00:00)",
+                                    );
+                                    if dst_has_sel {
+                                        ui.radio_value(
+                                            &mut self.dlg_dst_pos_mode,
+                                            3,
+                                            "Substituir Seleção",
+                                        );
+                                    }
+                                });
                             });
-                        }
+                        });
+
+                        ui.add_space(4.0);
+
+                        // 3. Operation Mode (Insert, Crossfade Splice, or Mix/Overlay)
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new("3. Como Colar ou Mesclar:").strong(),
+                                );
+                                ui.radio_value(
+                                    &mut self.dlg_transfer_mode,
+                                    0,
+                                    "📌 Colar / Inserir (abre espaço e empurra o restante da música)",
+                                );
+                                ui.radio_value(
+                                    &mut self.dlg_transfer_mode,
+                                    1,
+                                    "🔗 Emendar com Crossfade Suave (transição suave sem estalo nas bordas)",
+                                );
+                                ui.radio_value(
+                                    &mut self.dlg_transfer_mode,
+                                    2,
+                                    "🔀 Mesclar / Sobrepor (Mix — toca os dois trechos juntos ao mesmo tempo)",
+                                );
+
+                                if self.dlg_transfer_mode == 1 {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Duração do Crossfade:");
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.dlg_join_xfade_secs,
+                                                0.05..=8.0,
+                                            )
+                                            .suffix(" s"),
+                                        );
+                                    });
+                                } else if self.dlg_transfer_mode == 2 {
+                                    egui::Grid::new("mix_params_grid")
+                                        .num_columns(2)
+                                        .spacing([10.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.label("Volume do Trecho Inserido:");
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut self.dlg_mix_clip_gain_pct,
+                                                    0.0..=200.0,
+                                                )
+                                                .suffix(" %"),
+                                            );
+                                            ui.end_row();
+
+                                            ui.label("Volume da Música de Destino:");
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut self.dlg_mix_dst_gain_pct,
+                                                    0.0..=200.0,
+                                                )
+                                                .suffix(" %"),
+                                            );
+                                            ui.end_row();
+
+                                            ui.label("Fade In / Fade Out do Trecho:");
+                                            ui.horizontal(|ui| {
+                                                ui.label("In:");
+                                                ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut self.dlg_mix_fade_in_s,
+                                                    )
+                                                    .speed(0.05)
+                                                    .range(0.0..=10.0)
+                                                    .suffix(" s"),
+                                                );
+                                                ui.label("Out:");
+                                                ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut self.dlg_mix_fade_out_s,
+                                                    )
+                                                    .speed(0.05)
+                                                    .range(0.0..=10.0)
+                                                    .suffix(" s"),
+                                                );
+                                            });
+                                            ui.end_row();
+                                        });
+                                }
+                            });
+                        });
 
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            if ui.button("✔ Enviar Trecho Agora").clicked() {
-                                self.stop_playback();
-                                let src_idx = self.active_tab;
-                                let dst_idx = self.dlg_target_doc_idx.min(self.docs.len() - 1);
-                                if src_idx != dst_idx {
-                                    let (s, e) = self.docs[src_idx].target_range();
-                                    let clip = slice_frames(&self.docs[src_idx].buffer, s, e);
-                                    let dst_doc = &mut self.docs[dst_idx];
-                                    let at = dst_doc.cursor_frame;
-                                    let next_buf = match self.dlg_transfer_mode {
-                                        0 => insert_buffer(&dst_doc.buffer, at, &clip),
-                                        1 => concat_with_crossfade(
-                                            &dst_doc.buffer,
-                                            &clip,
-                                            self.dlg_join_xfade_secs,
-                                        ),
-                                        _ => mix_buffer(&dst_doc.buffer, at, &clip, 0.85),
+                            let build_result = |app: &Self| -> Option<(
+                                usize,
+                                AudioBuffer,
+                                usize,
+                                usize,
+                                String,
+                            )> {
+                                let dst_i = app.dlg_target_doc_idx.min(app.docs.len() - 1);
+                                let (clip, src_label) = if app.dlg_use_clipboard_source {
+                                    let c = app.clipboard.clone()?;
+                                    let lbl = if app.clipboard_source_title.is_empty() {
+                                        "Área de Transferência".to_string()
+                                    } else {
+                                        app.clipboard_source_title.clone()
                                     };
-                                    dst_doc.commit_buffer(next_buf, at, None);
-                                    self.active_tab = dst_idx;
-                                    self.status_msg =
-                                        "Trecho inserido na música de destino!".to_string();
+                                    (c, lbl)
+                                } else {
+                                    let src_i = app.dlg_src_doc_idx.min(app.docs.len() - 1);
+                                    let (s, e) = app.docs[src_i].target_range();
+                                    (
+                                        slice_frames(&app.docs[src_i].buffer, s, e),
+                                        app.docs[src_i].title.clone(),
+                                    )
+                                };
+
+                                let dst_doc = &app.docs[dst_i];
+                                let (base_buf, at_frame) = match app.dlg_dst_pos_mode {
+                                    1 => ((*dst_doc.buffer).clone(), dst_doc.buffer.num_frames()),
+                                    2 => ((*dst_doc.buffer).clone(), 0),
+                                    3 => {
+                                        if let Some((s, e)) = dst_doc.selection {
+                                            (delete_range(&dst_doc.buffer, s, e), s)
+                                        } else {
+                                            ((*dst_doc.buffer).clone(), dst_doc.cursor_frame)
+                                        }
+                                    }
+                                    _ => ((*dst_doc.buffer).clone(), dst_doc.cursor_frame),
+                                };
+
+                                let next_buf = match app.dlg_transfer_mode {
+                                    0 => insert_buffer(&base_buf, at_frame, &clip),
+                                    1 => {
+                                        if at_frame >= base_buf.num_frames() {
+                                            concat_with_crossfade(
+                                                &base_buf,
+                                                &clip,
+                                                app.dlg_join_xfade_secs,
+                                            )
+                                        } else {
+                                            insert_buffer_with_crossfade(
+                                                &base_buf,
+                                                at_frame,
+                                                &clip,
+                                                app.dlg_join_xfade_secs,
+                                            )
+                                        }
+                                    }
+                                    _ => mix_buffer_advanced(
+                                        &base_buf,
+                                        at_frame,
+                                        &clip,
+                                        (app.dlg_mix_dst_gain_pct / 100.0).clamp(0.0, 2.0),
+                                        (app.dlg_mix_clip_gain_pct / 100.0).clamp(0.0, 2.0),
+                                        app.dlg_mix_fade_in_s,
+                                        app.dlg_mix_fade_out_s,
+                                    ),
+                                };
+
+                                let clip_len_in_dst = ((clip.duration_secs()
+                                    * base_buf.sample_rate as f64)
+                                    .round()
+                                    as usize)
+                                    .max(1);
+                                let end_sel = (at_frame + clip_len_in_dst).min(next_buf.num_frames());
+                                Some((dst_i, next_buf, at_frame, end_sel, src_label))
+                            };
+
+                            if ui
+                                .button("✔ Aplicar na Janela de Destino")
+                                .clicked()
+                            {
+                                self.stop_playback();
+                                if let Some((dst_i, next_buf, at_f, end_f, src_label)) =
+                                    build_result(self)
+                                {
+                                    let dst_title = self.docs[dst_i].title.clone();
+                                    let dst_doc = &mut self.docs[dst_i];
+                                    let old_len = dst_doc.buffer.num_frames();
+                                    let new_len = next_buf.num_frames();
+                                    if new_len > old_len {
+                                        dst_doc
+                                            .annotations
+                                            .adjust_for_edit(at_f, at_f, new_len - old_len);
+                                    }
+                                    dst_doc.commit_buffer(next_buf, at_f, Some((at_f, end_f)));
+                                    self.active_tab = dst_i;
+                                    self.status_msg = format!(
+                                        "Aplicado trecho de '{src_label}' em '{dst_title}' ({})!",
+                                        format_timecode(dst_doc.buffer.frame_to_secs(at_f))
+                                    );
                                 }
                                 self.dialog = ActiveDialog::None;
                             }
+
+                            if ui
+                                .button(if self.playback.is_playing() {
+                                    "■ Stop Preview"
+                                } else {
+                                    "▶ Preview"
+                                })
+                                .clicked()
+                            {
+                                if self.playback.is_playing() {
+                                    self.stop_playback();
+                                } else if let Some((_, preview_buf, at_f, end_f, _)) =
+                                    build_result(self)
+                                {
+                                    let pre_roll = (preview_buf.sample_rate as usize * 2).min(at_f);
+                                    let p_start = at_f.saturating_sub(pre_roll);
+                                    let p_end = (end_f + preview_buf.sample_rate as usize * 2)
+                                        .min(preview_buf.num_frames());
+                                    let seg = slice_frames(&preview_buf, p_start, p_end);
+                                    self.preview_processed_buffer(seg);
+                                }
+                            }
+
                             if ui.button("Cancel").clicked() {
+                                self.stop_playback();
                                 self.dialog = ActiveDialog::None;
                             }
                         });
                     });
                 if !open {
+                    self.stop_playback();
                     self.dialog = ActiveDialog::None;
                 }
             }

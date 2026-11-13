@@ -156,6 +156,34 @@ pub fn insert_buffer(buf: &AudioBuffer, at_frame: usize, clip: &AudioBuffer) -> 
     AudioBuffer::new(buf.sample_rate, ch, out)
 }
 
+/// Inserts `clip` into `buf` at `at_frame` with a smooth equal-power crossfade (`crossfade_secs`)
+/// at both the entry splice (`at_frame`) and the exit splice (`at_frame + clip_len`).
+pub fn insert_buffer_with_crossfade(
+    buf: &AudioBuffer,
+    at_frame: usize,
+    clip: &AudioBuffer,
+    crossfade_secs: f64,
+) -> AudioBuffer {
+    let adapted = adapt_buffer(clip, buf.sample_rate, buf.channels);
+    if crossfade_secs <= 0.001 || adapted.num_frames() < 16 || buf.num_frames() < 16 {
+        return insert_buffer(buf, at_frame, &adapted);
+    }
+    let pos = at_frame.min(buf.num_frames());
+    let left_part = slice_frames(buf, 0, pos);
+    let right_part = slice_frames(buf, pos, buf.num_frames());
+
+    let joined_left = if left_part.num_frames() > 8 {
+        concat_with_crossfade(&left_part, &adapted, crossfade_secs)
+    } else {
+        adapted
+    };
+    if right_part.num_frames() > 8 {
+        concat_with_crossfade(&joined_left, &right_part, crossfade_secs)
+    } else {
+        joined_left
+    }
+}
+
 /// Mixes `clip` into `buf` starting at `at_frame`. Extends `buf` if `clip` goes past the end.
 pub fn mix_buffer(
     buf: &AudioBuffer,
@@ -163,18 +191,52 @@ pub fn mix_buffer(
     clip: &AudioBuffer,
     clip_gain: f32,
 ) -> AudioBuffer {
+    mix_buffer_advanced(buf, at_frame, clip, 1.0, clip_gain, 0.015, 0.015)
+}
+
+/// Advanced Sound Forge `Paste Special -> Mix` / `Crossfade Mix`:
+/// Mixes `clip` into `buf` starting at `at_frame`, with independent destination gain (`dst_gain`),
+/// source clip gain (`clip_gain`), and smooth fade-in / fade-out on the mixed clip.
+pub fn mix_buffer_advanced(
+    buf: &AudioBuffer,
+    at_frame: usize,
+    clip: &AudioBuffer,
+    dst_gain: f32,
+    clip_gain: f32,
+    fade_in_secs: f64,
+    fade_out_secs: f64,
+) -> AudioBuffer {
     let adapted = adapt_buffer(clip, buf.sample_rate, buf.channels);
     let ch = buf.channels;
-    let total_frames = buf.num_frames().max(at_frame + adapted.num_frames());
+    let sr = buf.sample_rate as f64;
+    let clip_frames = adapted.num_frames();
+    let total_frames = buf.num_frames().max(at_frame + clip_frames);
     let mut out = vec![0.0_f32; total_frames * ch];
     out[..buf.samples.len()].copy_from_slice(&buf.samples);
 
-    let clip_frames = adapted.num_frames();
+    let fi_frames = ((fade_in_secs.max(0.0) * sr).round() as usize).min(clip_frames / 2);
+    let fo_frames = ((fade_out_secs.max(0.0) * sr).round() as usize).min(clip_frames / 2);
+
     for f in 0..clip_frames {
         let dst_f = at_frame + f;
+        let mut env = 1.0_f32;
+        if fi_frames > 0 && f < fi_frames {
+            let t = f as f32 / fi_frames as f32;
+            env *= 0.5 - 0.5 * (PI * t).cos();
+        }
+        if fo_frames > 0 && f >= clip_frames.saturating_sub(fo_frames) {
+            let rem = clip_frames.saturating_sub(1 + f);
+            let t = rem as f32 / fo_frames as f32;
+            env *= 0.5 - 0.5 * (PI * t).cos();
+        }
+        // Smoothly transition destination gain inside the overlap region
+        let eff_dst_gain = 1.0 + (dst_gain - 1.0) * env;
+        let eff_clip_gain = clip_gain * env;
         for c in 0..ch {
             let idx = dst_f * ch + c;
-            out[idx] = (out[idx] + adapted.get_sample(f, c) * clip_gain).clamp(-1.0, 1.0);
+            let dst_s = out[idx] * eff_dst_gain;
+            let src_s = adapted.get_sample(f, c) * eff_clip_gain;
+            out[idx] = (dst_s + src_s).clamp(-1.0, 1.0);
         }
     }
     AudioBuffer::new(buf.sample_rate, ch, out)
@@ -1264,5 +1326,11 @@ mod tests {
 
         let eq = apply_3band_eq(&dc_clean, 0, 4410, 3.0, -2.0, 2.0);
         assert_eq!(eq.num_frames(), dc_clean.num_frames());
+
+        let spliced = insert_buffer_with_crossfade(&a, 22050, &b, 0.1);
+        assert!(spliced.duration_secs() > 1.7 && spliced.duration_secs() < 2.0);
+
+        let mixed = mix_buffer_advanced(&a, 10000, &b, 0.85, 1.0, 0.05, 0.05);
+        assert!(mixed.num_frames() >= a.num_frames());
     }
 }

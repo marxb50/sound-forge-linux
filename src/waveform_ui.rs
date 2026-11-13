@@ -25,6 +25,13 @@ pub enum DocWindowAction {
     ToggleLoopPlay,
     ToggleMaximize,
     CloseWindow,
+    CopySelection,
+    CutSelection,
+    PasteInsertHere,
+    PasteCrossfadeHere,
+    PasteMixHere,
+    DeleteSelection,
+    TrimCropSelection,
     SendSelectionToOtherDoc,
     OpenTimeStretch,
     ApplyWindowRate,
@@ -59,6 +66,7 @@ pub fn draw_sound_forge_doc_window(
     is_active: bool,
     is_maximized: bool,
     has_multiple_docs: bool,
+    has_clipboard: bool,
     override_height: Option<f32>,
     interaction: &mut WaveformInteraction,
     playhead_frame: Option<usize>,
@@ -191,14 +199,67 @@ pub fn draw_sound_forge_doc_window(
 
                             if has_multiple_docs && doc.selection.is_some() {
                                 if ui
-                                    .button("📥 Enviar p/ Outra Música")
+                                    .small_button("📥 Enviar p/ Outra Janela")
                                     .on_hover_text(
-                                        "Envia o trecho selecionado desta música diretamente para outra música aberta",
+                                        "Envia/Cola/Mescla o trecho selecionado desta música diretamente em outra janela aberta",
                                     )
                                     .clicked()
                                 {
                                     action = DocWindowAction::SendSelectionToOtherDoc;
                                 }
+                            }
+
+                            if has_clipboard {
+                                if ui
+                                    .small_button("🔀 Mesclar Aqui...")
+                                    .on_hover_text(
+                                        "Mescla (sobrepõe/mixa) o trecho copiado na posição do cursor desta janela com ajuste de volume e fade",
+                                    )
+                                    .clicked()
+                                {
+                                    action = DocWindowAction::PasteMixHere;
+                                }
+                                if ui
+                                    .small_button("🔗 Colar c/ Crossfade")
+                                    .on_hover_text(
+                                        "Insere o trecho copiado na posição do cursor desta janela com Crossfade suave nas bordas",
+                                    )
+                                    .clicked()
+                                {
+                                    action = DocWindowAction::PasteCrossfadeHere;
+                                }
+                                if ui
+                                    .small_button("📌 Colar Aqui")
+                                    .on_hover_text(
+                                        "Cola (insere) o trecho copiado na posição do cursor desta janela (Ctrl+V)",
+                                    )
+                                    .clicked()
+                                {
+                                    action = DocWindowAction::PasteInsertHere;
+                                }
+                            }
+
+                            if doc.selection.is_some() {
+                                if ui
+                                    .small_button("✂ Recortar")
+                                    .on_hover_text("Recorta o trecho selecionado para colar/mesclar em outra janela (Ctrl+X)")
+                                    .clicked()
+                                {
+                                    action = DocWindowAction::CutSelection;
+                                }
+                                if ui
+                                    .small_button("📋 Copiar Trecho")
+                                    .on_hover_text("Copia o trecho selecionado para colar/mesclar em outra janela (Ctrl+C)")
+                                    .clicked()
+                                {
+                                    action = DocWindowAction::CopySelection;
+                                }
+                            } else if ui
+                                .small_button("📋 Copiar Música")
+                                .on_hover_text("Copia a música inteira desta janela para colar ou mesclar em outra janela")
+                                .clicked()
+                            {
+                                action = DocWindowAction::CopySelection;
                             }
                         });
                     });
@@ -214,7 +275,10 @@ pub fn draw_sound_forge_doc_window(
             let (body_rect, body_resp) =
                 ui.allocate_exact_size(Vec2::new(avail_w, body_h), Sense::click_and_drag());
 
-            if body_resp.clicked() || body_resp.drag_started() {
+            if body_resp.clicked()
+                || body_resp.secondary_clicked()
+                || body_resp.drag_started()
+            {
                 action = DocWindowAction::Activate;
             }
 
@@ -570,6 +634,64 @@ pub fn draw_sound_forge_doc_window(
                     action = DocWindowAction::PlayFrom(doc.cursor_frame);
                     ui.close_menu();
                 }
+                ui.separator();
+                if doc.selection.is_some() {
+                    if ui.button("📋 Copiar Trecho Selecionado (Ctrl+C)").clicked() {
+                        action = DocWindowAction::CopySelection;
+                        ui.close_menu();
+                    }
+                    if ui.button("✂ Recortar Trecho Selecionado (Ctrl+X)").clicked() {
+                        action = DocWindowAction::CutSelection;
+                        ui.close_menu();
+                    }
+                } else if ui.button("📋 Copiar Música Inteira desta Janela (Ctrl+C)").clicked() {
+                    action = DocWindowAction::CopySelection;
+                    ui.close_menu();
+                }
+                if has_clipboard {
+                    if ui.button("📌 Colar no Cursor (Ctrl+V)").clicked() {
+                        action = DocWindowAction::PasteInsertHere;
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("🔗 Colar com Crossfade Suave no Cursor")
+                        .clicked()
+                    {
+                        action = DocWindowAction::PasteCrossfadeHere;
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("🔀 Mesclar / Sobrepor no Cursor (Ctrl+M)...")
+                        .clicked()
+                    {
+                        action = DocWindowAction::PasteMixHere;
+                        ui.close_menu();
+                    }
+                }
+                if has_multiple_docs {
+                    if ui
+                        .button("📥 Enviar / Mesclar em Outra Janela...")
+                        .clicked()
+                    {
+                        action = DocWindowAction::SendSelectionToOtherDoc;
+                        ui.close_menu();
+                    }
+                }
+                if doc.selection.is_some() {
+                    ui.separator();
+                    if ui
+                        .button("🔪 Aparar (Trim/Crop — manter só seleção) (Ctrl+T)")
+                        .clicked()
+                    {
+                        action = DocWindowAction::TrimCropSelection;
+                        ui.close_menu();
+                    }
+                    if ui.button("🗑 Excluir Selecionado (Del)").clicked() {
+                        action = DocWindowAction::DeleteSelection;
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
                 if ui.button("🚩 Inserir Marcador aqui (M)").clicked() {
                     doc.annotations.add_marker(doc.cursor_frame, None);
                     ui.close_menu();
@@ -593,12 +715,6 @@ pub fn draw_sound_forge_doc_window(
                     if ui.button("📏 Criar Região da Seleção (R)").clicked() {
                         doc.annotations.add_region(s, e, None);
                         ui.close_menu();
-                    }
-                    if has_multiple_docs {
-                        if ui.button("📥 Enviar Seleção para Outra Música...").clicked() {
-                            action = DocWindowAction::SendSelectionToOtherDoc;
-                            ui.close_menu();
-                        }
                     }
                     if ui.button("🔍 Zoom na Seleção").clicked() {
                         doc.zoom_selection();
@@ -1208,6 +1324,23 @@ fn handle_waveform_and_marker_interactions(
                     doc.selection = None;
                 }
                 seek_target = Some(doc.cursor_frame);
+            }
+        }
+    } else if response.secondary_clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if wave_rect.contains(pos) || ruler_rect.contains(pos) {
+                let mut f = x_to_frame(pos.x);
+                if snap_zero_crossing {
+                    let search = (doc.buffer.sample_rate as usize / 80).max(32);
+                    f = doc.buffer.find_nearest_zero_crossing(f, search);
+                }
+                let inside_sel = doc
+                    .selection
+                    .map(|(s, e)| f >= s && f <= e)
+                    .unwrap_or(false);
+                if !inside_sel {
+                    doc.cursor_frame = f;
+                }
             }
         }
     }
