@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sound Forge Linux
+GenericName=Audio Waveform Editor
+Comment=Clean-room Rust audio editor inspired by Sound Forge Pro 10.0
+Exec=sound-forge-linux %f
+Icon=sound-forge-linux
+Terminal=false
+Categories=AudioVideo;Audio;AudioVideoEditing;
+MimeType=audio/mpeg;audio/wav;audio/x-wav;audio/flac;audio/ogg;audio/mp4;audio/aac;
+StartupNotify=true

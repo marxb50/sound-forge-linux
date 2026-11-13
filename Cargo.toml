@@ -1,0 +1,16 @@
+[package]
+name = "sound-forge-linux"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room open-source Linux audio waveform editor in native Rust, inspired by Sound Forge Pro 10.0"
+license = "MIT"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+hound = "3.5"
+symphonia = { version = "0.5", features = ["mp3", "wav", "flac", "ogg", "pcm", "aac", "isomp4"] }
+cpal = "0.15"
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
