@@ -25,10 +25,21 @@ pub struct AudioDocument {
     pub view_start: f64,
     pub view_frames: f64,
     pub dirty: bool,
+    /// Per-window pitch/rate slider (`Rate: 0,00` in Sound Forge bottom bar, -12..+12)
+    pub rate_slider: f32,
+    /// Channel active mask `[Left, Right]` toggled via the blue `[1] [-]` and `[2] [-]` badges.
+    pub channel_enabled: [bool; 2],
+    /// Whether this MDI window is collapsed/minimized when stacked.
+    pub minimized: bool,
 }
 
 impl AudioDocument {
-    pub fn from_buffer(id: usize, title: String, path: Option<PathBuf>, buffer: AudioBuffer) -> Self {
+    pub fn from_buffer(
+        id: usize,
+        title: String,
+        path: Option<PathBuf>,
+        buffer: AudioBuffer,
+    ) -> Self {
         let total = buffer.num_frames().max(1) as f64;
         let pyramid = WaveformPyramid::build(&buffer);
         Self {
@@ -45,7 +56,27 @@ impl AudioDocument {
             view_start: 0.0,
             view_frames: total,
             dirty: false,
+            rate_slider: 0.0,
+            channel_enabled: [true, true],
+            minimized: false,
         }
+    }
+
+    pub fn formatted_title_with_duration(&self) -> String {
+        let secs = self.buffer.duration_secs().round() as u64;
+        let m = secs / 60;
+        let s = secs % 60;
+        let dirty_mark = if self.dirty { " *" } else { "" };
+        if m > 0 {
+            format!("{} ({}m {:02}s){}", self.title, m, s, dirty_mark)
+        } else {
+            format!("{} ({}s){}", self.title, s, dirty_mark)
+        }
+    }
+
+    /// Converts per-window `Rate` (-12.0 .. +12.0 semitones) to playback speed factor.
+    pub fn rate_to_speed_factor(&self) -> f64 {
+        2.0_f64.powf(self.rate_slider as f64 / 12.0)
     }
 
     pub fn push_undo(&mut self) {
@@ -127,7 +158,6 @@ impl AudioDocument {
         }
     }
 
-    /// Returns active selection [start, end), or full buffer [0, num_frames) if nothing is selected.
     pub fn target_range(&self) -> (usize, usize) {
         if let Some((s, e)) = self.selection {
             if e > s {
@@ -139,15 +169,17 @@ impl AudioDocument {
 
     pub fn clamp_viewport(&mut self) {
         let total = self.buffer.num_frames().max(1) as f64;
-        self.view_frames = self.view_frames.clamp(64.0_f64.min(total), total);
-        self.view_start = self.view_start.clamp(0.0, (total - self.view_frames).max(0.0));
+        self.view_frames = self.view_frames.clamp(32.0_f64.min(total), total);
+        self.view_start = self
+            .view_start
+            .clamp(0.0, (total - self.view_frames).max(0.0));
     }
 
     pub fn zoom_at(&mut self, factor: f64, anchor_ratio: f64) {
         let total = self.buffer.num_frames().max(1) as f64;
         let anchor_ratio = anchor_ratio.clamp(0.0, 1.0);
         let anchor_frame = self.view_start + self.view_frames * anchor_ratio;
-        let min_frames = 64.0_f64.min(total);
+        let min_frames = 32.0_f64.min(total);
         let new_frames = (self.view_frames * factor).clamp(min_frames, total);
         self.view_frames = new_frames;
         self.view_start = anchor_frame - new_frames * anchor_ratio;
