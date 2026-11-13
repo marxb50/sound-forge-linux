@@ -26,6 +26,8 @@ pub enum DocWindowAction {
     ToggleMaximize,
     CloseWindow,
     SendSelectionToOtherDoc,
+    OpenTimeStretch,
+    ApplyWindowRate,
 }
 
 pub struct WaveformInteraction {
@@ -684,22 +686,38 @@ pub fn draw_sound_forge_doc_window(
                         if ui
                             .add(
                                 egui::Label::new(
-                                    egui::RichText::new(format!("Rate: {:+.2}", doc.rate_slider))
-                                        .size(11.0),
+                                    egui::RichText::new(
+                                        format!("Rate: {:+.2}", doc.rate_slider).replace('.', ","),
+                                    )
+                                    .size(11.0),
                                 )
                                 .sense(Sense::click()),
                             )
-                            .on_hover_text("Clique para zerar Rate (0,00)")
+                            .on_hover_text("Clique para voltar à junção central (0,00 = Velocidade Original)")
                             .clicked()
                         {
                             doc.rate_slider = 0.0;
                         }
-                        ui.add(
-                            egui::Slider::new(&mut doc.rate_slider, -12.0..=12.0)
-                                .show_value(false)
-                                .trailing_fill(false),
-                        )
-                        .on_hover_text("Controle de Rate / Pitch desta janela (-12 a +12 semitons)");
+
+                        draw_sf10_rate_junction_slider(ui, &mut doc.rate_slider, &p);
+
+                        if doc.rate_slider.abs() > 0.05 {
+                            let spd_pct = (doc.rate_to_speed_factor() * 100.0).round();
+                            if ui
+                                .small_button(format!("✔ Gravar ({spd_pct:.0}%)"))
+                                .on_hover_text("Aplicar permanentemente esta velocidade (Time Stretch) na música")
+                                .clicked()
+                            {
+                                action = DocWindowAction::ApplyWindowRate;
+                            }
+                        }
+                        if ui
+                            .small_button("⏱ Time")
+                            .on_hover_text("Abrir Sony Time Stretch (Ralentar / Acelerar com Tempo Final exato)")
+                            .clicked()
+                        {
+                            action = DocWindowAction::OpenTimeStretch;
+                        }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Bottom-right corner resize handle (drag to resize height & width simultaneously!)
@@ -784,6 +802,96 @@ fn draw_sunken_box(ui: &mut Ui, text: &str, width: f32, p: &Palette) {
         text,
         FontId::monospace(10.0),
         p.text_main,
+    );
+}
+
+/// Draws the authentic Sound Forge 10 bottom-bar Rate slider (`————◀◀◆▶▶————`)
+/// with the orange triangle `▲` junction in the center between Ralentar (`-`) and Acelerar (`+`).
+fn draw_sf10_rate_junction_slider(ui: &mut Ui, rate: &mut f32, p: &Palette) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(118.0, 18.0), Sense::click_and_drag());
+    let pad = 8.0_f32;
+    let left = rect.left() + pad;
+    let right = rect.right() - pad;
+    let span = (right - left).max(10.0);
+    let cy = rect.center().y - 1.5;
+
+    if resp.double_clicked() {
+        *rate = 0.0;
+    } else if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let t = ((pos.x - left) / span).clamp(0.0, 1.0);
+            let val = (t * 24.0) - 12.0;
+            // Snap gently to the center junction (0.00)
+            *rate = if val.abs() < 0.35 { 0.0 } else { val };
+        }
+    }
+
+    let painter = ui.painter_at(rect);
+    // Horizontal groove line
+    painter.line_segment(
+        [Pos2::new(left, cy), Pos2::new(right, cy)],
+        Stroke::new(1.5, p.border),
+    );
+    painter.line_segment(
+        [Pos2::new(left, cy + 1.0), Pos2::new(right, cy + 1.0)],
+        Stroke::new(1.0, Color32::WHITE),
+    );
+
+    // Center orange triangle `▲` junction (0,00 = Velocidade Original)
+    let mid_x = left + span * 0.5;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(mid_x, cy + 2.5),
+            Pos2::new(mid_x - 3.5, cy + 8.5),
+            Pos2::new(mid_x + 3.5, cy + 8.5),
+        ],
+        Color32::from_rgb(225, 130, 45),
+        Stroke::new(0.8, Color32::from_rgb(135, 65, 15)),
+    ));
+
+    // Thumb position (`◀◆▶` Sound Forge triple-diamond thumb)
+    let t_cur = ((*rate + 12.0) / 24.0).clamp(0.0, 1.0);
+    let tx = left + t_cur * span;
+    let thumb_col = if resp.hovered() || resp.dragged() {
+        Color32::from_rgb(115, 125, 145)
+    } else {
+        Color32::from_rgb(145, 150, 160)
+    };
+    let thumb_stroke = Stroke::new(0.9, Color32::from_rgb(80, 85, 95));
+    // Left arrow `◀`
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(tx - 8.0, cy),
+            Pos2::new(tx - 3.5, cy - 3.8),
+            Pos2::new(tx - 3.5, cy + 3.8),
+        ],
+        thumb_col,
+        thumb_stroke,
+    ));
+    // Center diamond `◆`
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(tx, cy - 4.2),
+            Pos2::new(tx + 3.5, cy),
+            Pos2::new(tx, cy + 4.2),
+            Pos2::new(tx - 3.5, cy),
+        ],
+        Color32::from_rgb(175, 180, 190),
+        thumb_stroke,
+    ));
+    // Right arrow `▶`
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(tx + 8.0, cy),
+            Pos2::new(tx + 3.5, cy - 3.8),
+            Pos2::new(tx + 3.5, cy + 3.8),
+        ],
+        thumb_col,
+        thumb_stroke,
+    ));
+
+    resp.on_hover_text(
+        "Junção Ralentar (◀ esquerda) e Acelerar (direita ▶) • Duplo-clique volta para ▲ 0,00",
     );
 }
 

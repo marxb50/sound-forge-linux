@@ -902,7 +902,7 @@ pub fn change_speed_range_with_algo(
     if e - s < 32 || (speed_factor - 1.0).abs() < 1e-4 {
         return buf.clone();
     }
-    let speed = speed_factor.clamp(0.25, 4.0);
+    let speed = speed_factor.clamp(0.20, 4.0);
     let segment = slice_frames(buf, s, e);
     let processed = if algo == TimeStretchAlgorithm::VarispeedTape {
         varispeed_resample(&segment, speed)
@@ -970,7 +970,7 @@ pub fn time_stretch_wsola_window(
 ) -> AudioBuffer {
     let n = buf.num_frames();
     let ch = buf.channels;
-    let speed = speed_factor.clamp(0.25, 4.0);
+    let speed = speed_factor.clamp(0.20, 4.0);
     if n < 256 || (speed - 1.0).abs() < 1e-4 {
         return buf.clone();
     }

@@ -423,7 +423,14 @@ impl ForgeApp {
 
     fn open_time_stretch_dialog(&mut self) {
         let init_secs = self.active_target_duration_secs();
-        self.dlg_ts_percent_of_orig = (100.0 / self.playback_speed.max(0.20)).clamp(50.0, 500.0);
+        let win_rate_factor = self
+            .active_doc()
+            .map(|d| d.rate_to_speed_factor())
+            .unwrap_or(1.0);
+        let eff_speed = (self.playback_speed * win_rate_factor).clamp(0.20, 4.0);
+        if (eff_speed - 1.0).abs() > 0.005 {
+            self.dlg_ts_percent_of_orig = (100.0 / eff_speed).clamp(50.0, 500.0);
+        }
         let final_secs = init_secs * (self.dlg_ts_percent_of_orig / 100.0);
         self.dlg_ts_final_time_str = format_timecode_dot(final_secs);
         self.dialog = ActiveDialog::TimeStretch;
@@ -504,12 +511,8 @@ impl ForgeApp {
 
         // Combine global playback_speed with per-window `Rate` slider if non-zero!
         let rate_factor = doc.rate_to_speed_factor();
-        let effective_speed = (self.playback_speed * rate_factor).clamp(0.25, 4.0);
-        let effective_mode = if doc.rate_slider.abs() > 0.01 {
-            SpeedMode::Varispeed
-        } else {
-            self.speed_mode
-        };
+        let effective_speed = (self.playback_speed * rate_factor).clamp(0.20, 4.0);
+        let effective_mode = self.speed_mode;
 
         self.playing_doc_idx = Some(doc_idx);
         self.playback.play_range(
@@ -1699,13 +1702,8 @@ impl eframe::App for ForgeApp {
                                     && (self.docs[idx].rate_slider - prev_rate).abs() > 0.005
                                 {
                                     let rf = self.docs[idx].rate_to_speed_factor();
-                                    let spd = (self.playback_speed * rf).clamp(0.25, 4.0);
-                                    let mode = if self.docs[idx].rate_slider.abs() > 0.01 {
-                                        SpeedMode::Varispeed
-                                    } else {
-                                        self.speed_mode
-                                    };
-                                    self.playback.set_speed_live(spd, mode);
+                                    let spd = (self.playback_speed * rf).clamp(0.20, 4.0);
+                                    self.playback.set_speed_live(spd, self.speed_mode);
                                 }
                                 if act != DocWindowAction::None {
                                     pending_action = Some((idx, act));
@@ -1846,6 +1844,27 @@ impl eframe::App for ForgeApp {
                             self.dlg_target_doc_idx = (idx + 1) % self.docs.len().max(1);
                             self.dialog = ActiveDialog::SendToOtherDoc;
                         }
+                        DocWindowAction::OpenTimeStretch => {
+                            self.open_time_stretch_dialog();
+                        }
+                        DocWindowAction::ApplyWindowRate => {
+                            let rf = self
+                                .docs
+                                .get(idx)
+                                .map(|d| d.rate_to_speed_factor())
+                                .unwrap_or(1.0);
+                            if (rf - 1.0).abs() > 0.005 {
+                                let algo = if self.speed_mode == SpeedMode::PreservePitch {
+                                    TimeStretchAlgorithm::Music1MinFlange
+                                } else {
+                                    TimeStretchAlgorithm::VarispeedTape
+                                };
+                                self.apply_time_stretch_to_doc(rf, algo);
+                                if let Some(d) = self.docs.get_mut(idx) {
+                                    d.rate_slider = 0.0;
+                                }
+                            }
+                        }
                         DocWindowAction::None => {}
                     }
                 }
@@ -1880,21 +1899,163 @@ impl ForgeApp {
         );
     }
 
-    fn draw_dialog_time_boxes(&self, ui: &mut egui::Ui) {
+    fn draw_dialog_time_boxes(&self, ui: &mut egui::Ui, label_prefix: &str) {
         if let Some(doc) = self.active_doc() {
             let (s, e) = doc.target_range();
             let start_t = format_timecode(doc.buffer.frame_to_secs(s));
             let end_t = format_timecode(doc.buffer.frame_to_secs(e));
             let len_t = format_timecode(doc.buffer.frame_to_secs(e.saturating_sub(s)));
             ui.horizontal(|ui| {
-                ui.label("Preview limit: 00:00:15,000");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format!("[ {len_t} ]")).monospace().size(11.0));
-                    ui.label(egui::RichText::new(format!("[ {end_t} ]")).monospace().size(11.0));
-                    ui.label(egui::RichText::new(format!("[ {start_t} ]")).monospace().size(11.0));
-                });
+                ui.set_max_width(485.0);
+                ui.label(egui::RichText::new(label_prefix).size(11.5));
+                ui.add_space(24.0);
+                for txt in [start_t, end_t, len_t] {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(245, 246, 248))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(160, 165, 175)))
+                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(txt)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(egui::Color32::BLACK),
+                            );
+                        });
+                }
             });
         }
+    }
+
+    /// Custom-painted Sony Sound Forge 10 3D horizontal trackbar with rectangular thumb
+    /// and orange junction marker (`▲`) between Acelerar (< 100%) and Ralentar (> 100%).
+    fn draw_sony_time_stretch_slider(ui: &mut egui::Ui, pct_of_orig: &mut f64) -> bool {
+        let desired = egui::vec2(364.0, 32.0);
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
+        let mut changed = false;
+
+        // Logarithmic mapping: 50% (left, 2x faster) .. 100% (junction at ~30.1%) .. 500% (right, 5x slower)
+        let min_pct = 50.0_f64;
+        let max_pct = 500.0_f64;
+        let log_span = (max_pct / min_pct).ln();
+
+        let pad_x = 10.0_f32;
+        let track_left = rect.left() + pad_x;
+        let track_right = rect.right() - pad_x;
+        let track_w = (track_right - track_left).max(10.0);
+        let track_y = rect.top() + 13.0;
+
+        if response.double_clicked() {
+            *pct_of_orig = 100.0;
+            changed = true;
+        } else if response.dragged() || response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let t = ((pos.x - track_left) / track_w).clamp(0.0, 1.0) as f64;
+                let new_pct = min_pct * (t * log_span).exp();
+                // Snap gently to 100.0% when very close to the 100% junction
+                *pct_of_orig = if (new_pct - 100.0).abs() < 0.35 {
+                    100.0
+                } else {
+                    new_pct.clamp(min_pct, max_pct)
+                };
+                changed = true;
+            }
+        }
+
+        let painter = ui.painter_at(rect);
+
+        // 1. Sunken 3D groove track (exact look of Screenshot 2 `media_1794579206813_aeb4edf8.png`)
+        let groove_rect = egui::Rect::from_min_max(
+            egui::pos2(track_left, track_y - 2.0),
+            egui::pos2(track_right, track_y + 2.0),
+        );
+        painter.rect_filled(groove_rect, 1.0, egui::Color32::from_rgb(232, 234, 238));
+        painter.line_segment(
+            [groove_rect.left_top(), groove_rect.right_top()],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(145, 150, 158)),
+        );
+        painter.line_segment(
+            [groove_rect.left_bottom(), groove_rect.right_bottom()],
+            egui::Stroke::new(1.0, egui::Color32::WHITE),
+        );
+
+        // 2. Junction marker at 100% (Original Time — junction between Acelerar & Ralentar!)
+        let t_100 = ((100.0_f64 / min_pct).ln() / log_span) as f32;
+        let x_100 = track_left + t_100 * track_w;
+        painter.line_segment(
+            [egui::pos2(x_100, track_y - 7.0), egui::pos2(x_100, track_y + 7.0)],
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(218, 118, 35)),
+        );
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(x_100, track_y + 4.0),
+                egui::pos2(x_100 - 4.5, track_y + 11.0),
+                egui::pos2(x_100 + 4.5, track_y + 11.0),
+            ],
+            egui::Color32::from_rgb(228, 126, 38),
+            egui::Stroke::new(0.8, egui::Color32::from_rgb(135, 65, 12)),
+        ));
+
+        // Labels showing Acelerar (left of junction), 100% junction, and Ralentar (right of junction)
+        painter.text(
+            egui::pos2(track_left, rect.bottom() - 1.0),
+            egui::Align2::LEFT_BOTTOM,
+            "◀ Acelerar (-Tempo)",
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_rgb(35, 85, 155),
+        );
+        painter.text(
+            egui::pos2(x_100, rect.bottom() - 1.0),
+            egui::Align2::CENTER_BOTTOM,
+            "100%",
+            egui::FontId::monospace(9.5),
+            egui::Color32::from_rgb(185, 85, 15),
+        );
+        painter.text(
+            egui::pos2(track_right, rect.bottom() - 1.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "Ralentar (+Tempo) ▶",
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_rgb(35, 85, 155),
+        );
+
+        // 3. Classic Sony 3D rectangular block thumb (`14px x 20px`)
+        let t_cur = ((pct_of_orig.clamp(min_pct, max_pct) / min_pct).ln() / log_span) as f32;
+        let thumb_x = track_left + t_cur * track_w;
+        let thumb_rect = egui::Rect::from_center_size(
+            egui::pos2(thumb_x, track_y),
+            egui::vec2(14.0, 20.0),
+        );
+        let thumb_fill = if response.hovered() || response.dragged() {
+            egui::Color32::from_rgb(235, 240, 248)
+        } else {
+            egui::Color32::from_rgb(220, 223, 228)
+        };
+        painter.rect_filled(thumb_rect, 2.0, thumb_fill);
+        // 3D bevel highlight (top/left white, bottom/right dark gray)
+        painter.line_segment(
+            [thumb_rect.left_top(), thumb_rect.right_top()],
+            egui::Stroke::new(1.2, egui::Color32::WHITE),
+        );
+        painter.line_segment(
+            [thumb_rect.left_top(), thumb_rect.left_bottom()],
+            egui::Stroke::new(1.2, egui::Color32::WHITE),
+        );
+        painter.rect_stroke(
+            thumb_rect,
+            2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(95, 100, 110)),
+        );
+        // Center grip line inside thumb
+        painter.line_segment(
+            [
+                egui::pos2(thumb_x, thumb_rect.top() + 4.0),
+                egui::pos2(thumb_x, thumb_rect.bottom() - 4.0),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 155, 165)),
+        );
+
+        changed
     }
 
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
@@ -1912,7 +2073,10 @@ impl ForgeApp {
                 egui::Window::new(format!("Volume - {doc_title}"))
                     .open(&mut open)
                     .resizable(false)
+                    .fixed_size([415.0, 290.0])
+                    .default_pos([280.0, 150.0])
                     .show(ctx, |ui| {
+                        ui.set_max_width(405.0);
                         ui.horizontal(|ui| {
                             ui.label("Preset:");
                             egui::ComboBox::from_id_salt("vol_preset")
@@ -1945,35 +2109,33 @@ impl ForgeApp {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             // Left bordered box with vertical Gain fader (Screenshot 3!)
-                            egui::Frame::group(ui.style())
-                                .show(ui, |ui| {
-                                    ui.set_min_size(egui::vec2(280.0, 195.0));
-                                    ui.vertical_centered(|ui| {
-                                        let pct = if self.dlg_gain_db <= -90.0 {
-                                            0.0
-                                        } else {
-                                            10.0_f32.powf(self.dlg_gain_db / 20.0) * 100.0
-                                        };
-                                        let db_lbl = if self.dlg_gain_db <= -90.0 {
-                                            "-Inf. dB".to_string()
-                                        } else {
-                                            format!("{:.2} dB", self.dlg_gain_db).replace('.', ",")
-                                        };
-                                        let pct_lbl =
-                                            format!("({:.2} %)", pct).replace('.', ",");
-                                        ui.label(egui::RichText::new(db_lbl).strong().size(13.0));
-                                        ui.label(egui::RichText::new(pct_lbl).size(12.5));
-                                        ui.add_space(4.0);
-                                        ui.add(
-                                            egui::Slider::new(&mut self.dlg_gain_db, -60.0..=20.0)
-                                                .vertical()
-                                                .show_value(false),
-                                        );
-                                        ui.add_space(4.0);
-                                        ui.label("Gain");
-                                        ui.label("(-Inf. to 20 dB)");
-                                    });
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.set_width(280.0);
+                                    let pct = if self.dlg_gain_db <= -90.0 {
+                                        0.0
+                                    } else {
+                                        10.0_f32.powf(self.dlg_gain_db / 20.0) * 100.0
+                                    };
+                                    let db_lbl = if self.dlg_gain_db <= -90.0 {
+                                        "-Inf. dB".to_string()
+                                    } else {
+                                        format!("{:.2} dB", self.dlg_gain_db).replace('.', ",")
+                                    };
+                                    let pct_lbl = format!("({:.2} %)", pct).replace('.', ",");
+                                    ui.label(egui::RichText::new(db_lbl).strong().size(13.0));
+                                    ui.label(egui::RichText::new(pct_lbl).size(12.5));
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::Slider::new(&mut self.dlg_gain_db, -60.0..=20.0)
+                                            .vertical()
+                                            .show_value(false),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label("Gain");
+                                    ui.label("(-Inf. to 20 dB)");
                                 });
+                            });
 
                             // Right button column (OK, Cancel, Preview, Bypass, More...)
                             ui.vertical(|ui| {
@@ -2022,7 +2184,7 @@ impl ForgeApp {
                         });
 
                         ui.separator();
-                        self.draw_dialog_time_boxes(ui);
+                        self.draw_dialog_time_boxes(ui, "Preview limit: 00:00:10,000");
                     });
                 if !open {
                     self.dialog = ActiveDialog::None;
@@ -2043,14 +2205,17 @@ impl ForgeApp {
                 egui::Window::new(format!("Sony Time Stretch - {doc_title}"))
                     .open(&mut open)
                     .resizable(false)
+                    .fixed_size([505.0, 325.0])
+                    .default_pos([260.0, 140.0])
                     .show(ctx, |ui| {
+                        ui.set_max_width(495.0);
                         let mut pct_changed = false;
 
                         ui.horizontal(|ui| {
                             ui.label("Preset:");
                             egui::ComboBox::from_id_salt("ts_preset")
                                 .selected_text(&self.dlg_ts_preset)
-                                .width(270.0)
+                                .width(275.0)
                                 .show_ui(ui, |ui| {
                                     for (name, pct_orig) in [
                                         ("(Untitled)", self.dlg_ts_percent_of_orig),
@@ -2078,258 +2243,241 @@ impl ForgeApp {
 
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
+                            // CRITICAL: Wrap Frame::group content in `ui.vertical` so it NEVER inherits horizontal layout!
                             egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.set_min_width(385.0);
-                                // Classic SONY | Time Stretch dark banner (Screenshot 4 & 6!)
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(128, 128, 128))
-                                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("SONY.")
-                                                    .strong()
-                                                    .size(14.0)
-                                                    .color(egui::Color32::BLACK),
-                                            );
-                                            ui.separator();
-                                            ui.label(
-                                                egui::RichText::new("Time Stretch")
-                                                    .strong()
-                                                    .size(13.0)
-                                                    .color(egui::Color32::WHITE),
-                                            );
-                                        });
-                                    });
+                                ui.vertical(|ui| {
+                                    ui.set_width(376.0);
+                                    ui.set_max_width(376.0);
 
-                                ui.add_space(6.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("Mode:");
-                                    egui::ComboBox::from_id_salt("ts_mode_combo")
-                                        .selected_text(self.dlg_ts_algo.label())
-                                        .width(305.0)
-                                        .show_ui(ui, |ui| {
-                                            for &algo in TimeStretchAlgorithm::all() {
-                                                if ui
-                                                    .selectable_value(
-                                                        &mut self.dlg_ts_algo,
-                                                        algo,
-                                                        algo.label(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    pct_changed = true;
-                                                }
-                                            }
+                                    // Classic SONY | Time Stretch dark banner (Screenshot 4 & 6!)
+                                    egui::Frame::none()
+                                        .fill(egui::Color32::from_rgb(128, 128, 128))
+                                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                                        .show(ui, |ui| {
+                                            ui.set_width(360.0);
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new("SONY.")
+                                                        .strong()
+                                                        .size(14.0)
+                                                        .color(egui::Color32::BLACK),
+                                                );
+                                                ui.separator();
+                                                ui.label(
+                                                    egui::RichText::new("Time Stretch")
+                                                        .strong()
+                                                        .size(13.0)
+                                                        .color(egui::Color32::WHITE),
+                                                );
+                                            });
                                         });
-                                });
 
-                                ui.add_space(4.0);
-                                // Editable `Final Time` white box (matches `00:01:35.981` in Screenshot 6!)
-                                ui.horizontal(|ui| {
-                                    ui.label(format!(
-                                        "Final Time ({} to {}):",
-                                        format_timecode_dot(min_s),
-                                        format_timecode_dot(max_s)
-                                    ));
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            let te = ui.add(
-                                                egui::TextEdit::singleline(
-                                                    &mut self.dlg_ts_final_time_str,
-                                                )
-                                                .desired_width(98.0)
-                                                .font(egui::TextStyle::Monospace),
-                                            );
-                                            if te.changed() {
-                                                if let Some(parsed_s) =
-                                                    parse_timecode_secs(&self.dlg_ts_final_time_str)
-                                                {
-                                                    let clamped_s = parsed_s.clamp(min_s, max_s);
-                                                    self.dlg_ts_percent_of_orig = ((clamped_s
-                                                        / init_secs)
-                                                        * 100.0)
-                                                        .clamp(50.0, 500.0);
-                                                    if self.playback.is_playing()
-                                                        && self.dlg_realtime
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Mode:");
+                                        egui::ComboBox::from_id_salt("ts_mode_combo")
+                                            .selected_text(self.dlg_ts_algo.label())
+                                            .width(310.0)
+                                            .show_ui(ui, |ui| {
+                                                for &algo in TimeStretchAlgorithm::all() {
+                                                    if ui
+                                                        .selectable_value(
+                                                            &mut self.dlg_ts_algo,
+                                                            algo,
+                                                            algo.label(),
+                                                        )
+                                                        .clicked()
                                                     {
-                                                        let spd = (100.0
-                                                            / self
-                                                                .dlg_ts_percent_of_orig
-                                                                .max(20.0))
-                                                        .clamp(0.20, 4.0);
-                                                        let mode = if self.dlg_ts_algo
-                                                            == TimeStretchAlgorithm::VarispeedTape
-                                                        {
-                                                            SpeedMode::Varispeed
-                                                        } else {
-                                                            SpeedMode::PreservePitch
-                                                        };
-                                                        self.playback.set_speed_live(
-                                                            if self.dlg_bypass {
-                                                                1.0
-                                                            } else {
-                                                                spd
-                                                            },
-                                                            mode,
-                                                        );
+                                                        pct_changed = true;
                                                     }
                                                 }
-                                            }
-                                            if te.lost_focus() {
-                                                let final_secs = init_secs
-                                                    * (self.dlg_ts_percent_of_orig / 100.0);
-                                                self.dlg_ts_final_time_str =
-                                                    format_timecode_dot(final_secs);
-                                            }
-                                        },
-                                    );
-                                });
+                                            });
+                                    });
 
-                                // Horizontal Time Stretch slider (50% to 500% of original time)
-                                if ui
-                                    .add(
-                                        egui::Slider::new(
-                                            &mut self.dlg_ts_percent_of_orig,
-                                            50.0..=500.0,
-                                        )
-                                        .logarithmic(true)
-                                        .show_value(false),
-                                    )
-                                    .changed()
-                                {
-                                    pct_changed = true;
-                                }
-
-                                // Quick precision step buttons for exact tempo / time tuning
-                                ui.horizontal(|ui| {
-                                    for (lbl, delta_secs, delta_pct) in [
-                                        ("-5s", Some(-5.0), None),
-                                        ("-1s", Some(-1.0), None),
-                                        ("-1%", None, Some(-1.0)),
-                                        ("100%", None, Some(0.0)),
-                                        ("+1%", None, Some(1.0)),
-                                        ("+1s", Some(1.0), None),
-                                        ("+5s", Some(5.0), None),
-                                    ] {
-                                        if ui.small_button(lbl).clicked() {
-                                            if let Some(ds) = delta_secs {
-                                                let cur_s = init_secs
-                                                    * (self.dlg_ts_percent_of_orig / 100.0);
-                                                let next_s = (cur_s + ds).clamp(min_s, max_s);
-                                                self.dlg_ts_percent_of_orig =
-                                                    ((next_s / init_secs) * 100.0)
-                                                        .clamp(50.0, 500.0);
-                                            } else if let Some(dp) = delta_pct {
-                                                if dp == 0.0 {
-                                                    self.dlg_ts_percent_of_orig = 100.0;
-                                                } else {
-                                                    self.dlg_ts_percent_of_orig =
-                                                        (self.dlg_ts_percent_of_orig + dp)
-                                                            .clamp(50.0, 500.0);
+                                    ui.add_space(4.0);
+                                    // Editable `Final Time` row (fixed width, no right_to_left expansion!)
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!(
+                                            "Final Time ({} to {}):",
+                                            format_timecode_dot(min_s),
+                                            format_timecode_dot(max_s)
+                                        ));
+                                        let te = ui.add(
+                                            egui::TextEdit::singleline(
+                                                &mut self.dlg_ts_final_time_str,
+                                            )
+                                            .desired_width(94.0)
+                                            .font(egui::TextStyle::Monospace),
+                                        );
+                                        if te.changed() {
+                                            if let Some(parsed_s) =
+                                                parse_timecode_secs(&self.dlg_ts_final_time_str)
+                                            {
+                                                let clamped_s = parsed_s.clamp(min_s, max_s);
+                                                self.dlg_ts_percent_of_orig = ((clamped_s
+                                                    / init_secs)
+                                                    * 100.0)
+                                                    .clamp(50.0, 500.0);
+                                                if self.playback.is_playing() && self.dlg_realtime {
+                                                    let spd = (100.0
+                                                        / self.dlg_ts_percent_of_orig.max(20.0))
+                                                    .clamp(0.20, 4.0);
+                                                    let mode = if self.dlg_ts_algo
+                                                        == TimeStretchAlgorithm::VarispeedTape
+                                                    {
+                                                        SpeedMode::Varispeed
+                                                    } else {
+                                                        SpeedMode::PreservePitch
+                                                    };
+                                                    self.playback.set_speed_live(
+                                                        if self.dlg_bypass { 1.0 } else { spd },
+                                                        mode,
+                                                    );
                                                 }
                                             }
-                                            pct_changed = true;
                                         }
-                                    }
-                                });
-
-                                ui.separator();
-                                ui.horizontal(|ui| {
-                                    ui.label("Input format:");
-                                    egui::ComboBox::from_id_salt("ts_input_fmt")
-                                        .selected_text(self.dlg_ts_format.label())
-                                        .width(185.0)
-                                        .show_ui(ui, |ui| {
-                                            for fmt in [
-                                                TimeStretchInputFormat::TimeHms,
-                                                TimeStretchInputFormat::Percent,
-                                                TimeStretchInputFormat::TempoBpm,
-                                            ] {
-                                                ui.selectable_value(
-                                                    &mut self.dlg_ts_format,
-                                                    fmt,
-                                                    fmt.label(),
-                                                );
-                                            }
-                                        });
-                                });
-
-                                if self.dlg_ts_format == TimeStretchInputFormat::TempoBpm {
-                                    ui.horizontal(|ui| {
-                                        ui.label("BPM Inicial:");
-                                        ui.add(
-                                            egui::DragValue::new(&mut self.dlg_ts_bpm_from)
-                                                .range(30.0..=300.0),
-                                        );
-                                        ui.label("BPM Final:");
-                                        if ui
-                                            .add(
-                                                egui::DragValue::new(&mut self.dlg_ts_bpm_to)
-                                                    .range(30.0..=300.0),
-                                            )
-                                            .changed()
-                                            && self.dlg_ts_bpm_to > 0.0
-                                        {
-                                            self.dlg_ts_percent_of_orig = ((self.dlg_ts_bpm_from
-                                                / self.dlg_ts_bpm_to)
-                                                * 100.0)
-                                                .clamp(50.0, 500.0);
-                                            pct_changed = true;
+                                        if te.lost_focus() {
+                                            let final_secs = init_secs
+                                                * (self.dlg_ts_percent_of_orig / 100.0);
+                                            self.dlg_ts_final_time_str =
+                                                format_timecode_dot(final_secs);
                                         }
                                     });
-                                }
 
-                                ui.horizontal(|ui| {
-                                    ui.label("Initial Time (hr:mn:sc.xxx):");
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
+                                    // Custom-painted Sony 3D Horizontal Slider with rectangular thumb
+                                    // and `▲ 100%` junction between Acelerar and Ralentar!
+                                    if Self::draw_sony_time_stretch_slider(
+                                        ui,
+                                        &mut self.dlg_ts_percent_of_orig,
+                                    ) {
+                                        pct_changed = true;
+                                    }
+
+                                    // Quick precision step buttons for exact tempo / time tuning
+                                    ui.horizontal(|ui| {
+                                        for (lbl, delta_secs, delta_pct) in [
+                                            ("-5s", Some(-5.0), None),
+                                            ("-1s", Some(-1.0), None),
+                                            ("-1%", None, Some(-1.0)),
+                                            ("100% (Original)", None, Some(0.0)),
+                                            ("+1%", None, Some(1.0)),
+                                            ("+1s", Some(1.0), None),
+                                            ("+5s", Some(5.0), None),
+                                        ] {
+                                            if ui.small_button(lbl).clicked() {
+                                                if let Some(ds) = delta_secs {
+                                                    let cur_s = init_secs
+                                                        * (self.dlg_ts_percent_of_orig / 100.0);
+                                                    let next_s = (cur_s + ds).clamp(min_s, max_s);
+                                                    self.dlg_ts_percent_of_orig =
+                                                        ((next_s / init_secs) * 100.0)
+                                                            .clamp(50.0, 500.0);
+                                                } else if let Some(dp) = delta_pct {
+                                                    if dp == 0.0 {
+                                                        self.dlg_ts_percent_of_orig = 100.0;
+                                                    } else {
+                                                        self.dlg_ts_percent_of_orig =
+                                                            (self.dlg_ts_percent_of_orig + dp)
+                                                                .clamp(50.0, 500.0);
+                                                    }
+                                                }
+                                                pct_changed = true;
+                                            }
+                                        }
+                                    });
+
+                                    ui.separator();
+
+                                    egui::Grid::new("sony_ts_lower_grid")
+                                        .num_columns(2)
+                                        .min_col_width(180.0)
+                                        .spacing([12.0, 6.0])
+                                        .show(ui, |ui| {
+                                            ui.label("Input format:");
+                                            egui::ComboBox::from_id_salt("ts_input_fmt")
+                                                .selected_text(self.dlg_ts_format.label())
+                                                .width(175.0)
+                                                .show_ui(ui, |ui| {
+                                                    for fmt in [
+                                                        TimeStretchInputFormat::TimeHms,
+                                                        TimeStretchInputFormat::Percent,
+                                                        TimeStretchInputFormat::TempoBpm,
+                                                    ] {
+                                                        ui.selectable_value(
+                                                            &mut self.dlg_ts_format,
+                                                            fmt,
+                                                            fmt.label(),
+                                                        );
+                                                    }
+                                                });
+                                            ui.end_row();
+
+                                            ui.label("Initial Time (hr:mn:sc.xxx):");
                                             let mut init_str = format_timecode_dot(init_secs);
                                             ui.add_enabled(
                                                 false,
                                                 egui::TextEdit::singleline(&mut init_str)
-                                                    .desired_width(98.0)
+                                                    .desired_width(105.0)
                                                     .font(egui::TextStyle::Monospace),
                                             );
-                                        },
-                                    );
-                                });
+                                            ui.end_row();
 
-                                ui.horizontal(|ui| {
-                                    ui.label("Percent of original:");
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
+                                            ui.label("Percent of original:");
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(
+                                                            &mut self.dlg_ts_percent_of_orig,
+                                                        )
+                                                        .speed(0.15)
+                                                        .range(50.0..=500.0)
+                                                        .fixed_decimals(2)
+                                                        .suffix(" %"),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    pct_changed = true;
+                                                }
+                                                let speed_hint =
+                                                    if self.dlg_ts_percent_of_orig < 99.8 {
+                                                        "Acelerada"
+                                                    } else if self.dlg_ts_percent_of_orig > 100.2 {
+                                                        "Ralentada"
+                                                    } else {
+                                                        "Original"
+                                                    };
+                                                ui.label(
+                                                    egui::RichText::new(format!("({speed_hint})"))
+                                                        .size(11.0),
+                                                );
+                                            });
+                                            ui.end_row();
+                                        });
+
+                                    if self.dlg_ts_format == TimeStretchInputFormat::TempoBpm {
+                                        ui.horizontal(|ui| {
+                                            ui.label("BPM Inicial:");
+                                            ui.add(
+                                                egui::DragValue::new(&mut self.dlg_ts_bpm_from)
+                                                    .range(30.0..=300.0),
+                                            );
+                                            ui.label("BPM Final:");
                                             if ui
                                                 .add(
-                                                    egui::DragValue::new(
-                                                        &mut self.dlg_ts_percent_of_orig,
-                                                    )
-                                                    .speed(0.15)
-                                                    .range(50.0..=500.0)
-                                                    .fixed_decimals(2)
-                                                    .suffix(" %"),
+                                                    egui::DragValue::new(&mut self.dlg_ts_bpm_to)
+                                                        .range(30.0..=300.0),
                                                 )
                                                 .changed()
+                                                && self.dlg_ts_bpm_to > 0.0
                                             {
+                                                self.dlg_ts_percent_of_orig = ((self.dlg_ts_bpm_from
+                                                    / self.dlg_ts_bpm_to)
+                                                    * 100.0)
+                                                    .clamp(50.0, 500.0);
                                                 pct_changed = true;
                                             }
-                                            let speed_hint = if self.dlg_ts_percent_of_orig < 99.8 {
-                                                " (Mais rápida)"
-                                            } else if self.dlg_ts_percent_of_orig > 100.2 {
-                                                " (Mais lenta)"
-                                            } else {
-                                                ""
-                                            };
-                                            if !speed_hint.is_empty() {
-                                                ui.label(
-                                                    egui::RichText::new(speed_hint).size(11.0),
-                                                );
-                                            }
-                                        },
-                                    );
+                                        });
+                                    }
                                 });
                             });
 
@@ -2408,13 +2556,13 @@ impl ForgeApp {
                                     self.playback.set_speed_live(spd, preview_mode);
                                 }
                                 ui.checkbox(&mut self.dlg_realtime, "Real-time");
-                                ui.add_space(32.0);
+                                ui.add_space(28.0);
                                 let _ = ui.add_sized([92.0, 24.0], egui::Button::new("More..."));
                             });
                         });
 
                         ui.separator();
-                        self.draw_dialog_time_boxes(ui);
+                        self.draw_dialog_time_boxes(ui, "CPU %");
                     });
                 if !open {
                     self.stop_playback();
