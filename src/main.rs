@@ -233,7 +233,7 @@ impl ForgeApp {
             interaction: WaveformInteraction::default(),
             loop_enabled: false,
             snap_zero_crossing: true,
-            play_on_click: true,
+            play_on_click: false,
             playback_speed: 1.0,
             speed_mode: SpeedMode::PreservePitch,
             dialog: ActiveDialog::None,
@@ -1626,8 +1626,8 @@ impl eframe::App for ForgeApp {
                 {
                     self.insert_marker_now();
                 }
-                ui.toggle_value(&mut self.play_on_click, "▶ Tocar ao Clicar")
-                    .on_hover_text("Quando ativo, clicar na onda sonora ou em um marcador já inicia/pula a reprodução imediatamente daquele ponto");
+                ui.toggle_value(&mut self.play_on_click, "▶ Auto-Tocar ao Clicar")
+                    .on_hover_text("Desligado (padrão): se estiver pausado e você clicar em outro ponto, continua pausado (só toca ao apertar Espaço). Se já estiver tocando, pula e continua tocando.");
 
                 ui.separator();
                 ui.label("Velocidade:");
@@ -1991,16 +1991,17 @@ impl eframe::App for ForgeApp {
                                     }
                                 })
                             });
+                            if let Some(d) = self.docs.get_mut(idx) {
+                                d.cursor_frame = frame;
+                            }
                             if self.playback.is_playing() && self.playing_doc_idx == Some(idx) {
-                                // Already playing this song -> jump immediately to the clicked position!
+                                // Already playing this song -> jump immediately and keep playing!
                                 self.playback.seek_to_source_frame(frame, sel_end);
                             } else if self.playback.is_playing() || self.play_on_click {
-                                // Either another song was playing or `play_on_click` is enabled -> start playing here!
-                                if let Some(d) = self.docs.get_mut(idx) {
-                                    d.cursor_frame = frame;
-                                }
+                                // Another song was already playing, or user enabled auto-play when paused
                                 self.play_doc(idx, sel_end.is_none());
                             }
+                            // Otherwise: audio is paused -> stays paused at the new cursor_frame until Space / Play!
                         }
                         DocWindowAction::PlayFrom(frame) => {
                             if let Some(d) = self.docs.get_mut(idx) {
