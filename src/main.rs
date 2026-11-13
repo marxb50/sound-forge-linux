@@ -24,7 +24,8 @@ use crate::theme::{
     UiSkin,
 };
 use crate::waveform_ui::{
-    draw_sound_forge_doc_window, draw_vu_meter, ActiveTool, DocWindowAction, WaveformInteraction,
+    draw_sound_forge_doc_window, draw_vu_meter, ActiveTool, DocWindowAction, DropTargetInfo,
+    WaveformInteraction,
 };
 use eframe::egui;
 use std::path::PathBuf;
@@ -75,6 +76,15 @@ impl TimeStretchInputFormat {
             TimeStretchInputFormat::TempoBpm => "Tempo (BPM)",
         }
     }
+}
+
+#[derive(Clone)]
+struct PendingDropState {
+    clip: AudioBuffer,
+    src_title: String,
+    dst_doc_idx: usize,
+    dst_frame: usize,
+    screen_pos: egui::Pos2,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -202,6 +212,7 @@ struct ForgeApp {
     dlg_export_sr: Option<u32>,
 
     // Panels & status
+    pending_drop: Option<PendingDropState>,
     show_markers_panel: bool,
     show_meter_panel: bool,
     ffmpeg_path: Option<PathBuf>,
@@ -285,6 +296,7 @@ impl ForgeApp {
             dlg_mix_fade_out_s: 0.15,
             dlg_export_format: ExportFormat::Wav24,
             dlg_export_sr: None,
+            pending_drop: None,
             show_markers_panel: false,
             show_meter_panel: true,
             ffmpeg_path,
@@ -637,6 +649,7 @@ impl ForgeApp {
         let Some(doc) = self.active_doc_mut() else {
             return;
         };
+        let was_fit = doc.view_frames >= doc.buffer.num_frames().max(1) as f64 * 0.88;
         let dst_title = doc.title.clone();
         let (ins_at, base_buf) = if let Some((s, e)) = doc.selection {
             doc.annotations.adjust_for_edit(s, e, 0);
@@ -648,6 +661,9 @@ impl ForgeApp {
         let added = next_buf.num_frames().saturating_sub(base_buf.num_frames());
         doc.annotations.adjust_for_edit(ins_at, ins_at, added);
         doc.commit_buffer(next_buf, ins_at + added, Some((ins_at, ins_at + added)));
+        if was_fit {
+            doc.zoom_fit();
+        }
         self.status_msg = format!(
             "Colado trecho de '{src_name}' em '{dst_title}' na posição {}.",
             format_timecode(doc.buffer.frame_to_secs(ins_at))
@@ -670,6 +686,7 @@ impl ForgeApp {
         let Some(doc) = self.active_doc_mut() else {
             return;
         };
+        let was_fit = doc.view_frames >= doc.buffer.num_frames().max(1) as f64 * 0.88;
         let dst_title = doc.title.clone();
         let (ins_at, base_buf) = if let Some((s, e)) = doc.selection {
             doc.annotations.adjust_for_edit(s, e, 0);
@@ -682,6 +699,9 @@ impl ForgeApp {
         doc.annotations.adjust_for_edit(ins_at, ins_at, added);
         let end_sel = (ins_at + added.max(1)).min(next_buf.num_frames());
         doc.commit_buffer(next_buf, end_sel, Some((ins_at, end_sel)));
+        if was_fit {
+            doc.zoom_fit();
+        }
         self.status_msg = format!(
             "Colado com Crossfade suave ({xfade_s:.2}s) de '{src_name}' em '{dst_title}'!",
         );
@@ -706,6 +726,7 @@ impl ForgeApp {
         let Some(doc) = self.active_doc_mut() else {
             return;
         };
+        let was_fit = doc.view_frames >= doc.buffer.num_frames().max(1) as f64 * 0.88;
         let dst_title = doc.title.clone();
         let at = doc.selection.map(|(s, _)| s).unwrap_or(doc.cursor_frame);
         let next_buf = mix_buffer_advanced(&doc.buffer, at, &clip, dst_gain, clip_gain, fi, fo);
@@ -714,6 +735,9 @@ impl ForgeApp {
             .max(1);
         let end_sel = (at + clip_frames_in_dst).min(next_buf.num_frames());
         doc.commit_buffer(next_buf, at, Some((at, end_sel)));
+        if was_fit {
+            doc.zoom_fit();
+        }
         self.status_msg = format!(
             "Mesclado (Mix) trecho de '{src_name}' sobre '{dst_title}' em {}!",
             format_timecode(doc.buffer.frame_to_secs(at))
@@ -793,8 +817,11 @@ impl ForgeApp {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let ctrl = ctx.input(|i| i.modifiers.ctrl);
+        let ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
         let shift = ctx.input(|i| i.modifiers.shift);
+        let ev_copy = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        let ev_cut = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Cut)));
+        let ev_paste = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
 
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.toggle_play();
@@ -858,13 +885,13 @@ impl ForgeApp {
                     doc.redo();
                 }
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::X)) {
+            if ctx.input(|i| i.key_pressed(egui::Key::X)) || ev_cut {
                 self.action_cut();
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::C)) {
+            if ctx.input(|i| i.key_pressed(egui::Key::C)) || ev_copy {
                 self.action_copy();
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::V)) {
+            if ctx.input(|i| i.key_pressed(egui::Key::V)) || ev_paste {
                 self.action_paste();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::M)) {
@@ -885,6 +912,14 @@ impl ForgeApp {
                 if let Some(doc) = self.active_doc_mut() {
                     doc.zoom_fit();
                 }
+            }
+        } else {
+            if ev_cut {
+                self.action_cut();
+            } else if ev_copy {
+                self.action_copy();
+            } else if ev_paste {
+                self.action_paste();
             }
         }
     }
@@ -1868,6 +1903,7 @@ impl eframe::App for ForgeApp {
                 };
 
                 let mut pending_action: Option<(usize, DocWindowAction)> = None;
+                let mut drop_targets: Vec<DropTargetInfo> = Vec::with_capacity(num_docs);
 
                 match self.mdi_layout {
                     MdiLayoutMode::TileHorizontally => {
@@ -1877,8 +1913,9 @@ impl eframe::App for ForgeApp {
                                 let is_playing_this = is_playing && self.playing_doc_idx == Some(idx);
                                 let pf = if is_playing_this { cur_play_frame } else { None };
                                 let prev_rate = self.docs[idx].rate_slider;
-                                let act = draw_sound_forge_doc_window(
+                                let (act, dt) = draw_sound_forge_doc_window(
                                     ui,
+                                    idx,
                                     &mut self.docs[idx],
                                     is_active,
                                     false,
@@ -1893,6 +1930,9 @@ impl eframe::App for ForgeApp {
                                     self.active_tool,
                                     self.skin,
                                 );
+                                if let Some(d_info) = dt {
+                                    drop_targets.push(d_info);
+                                }
                                 if is_playing_this
                                     && (self.docs[idx].rate_slider - prev_rate).abs() > 0.005
                                 {
@@ -1914,8 +1954,9 @@ impl eframe::App for ForgeApp {
                                 let is_active = idx == self.active_tab;
                                 let is_playing_this = is_playing && self.playing_doc_idx == Some(idx);
                                 let pf = if is_playing_this { cur_play_frame } else { None };
-                                let act = draw_sound_forge_doc_window(
+                                let (act, dt) = draw_sound_forge_doc_window(
                                     col_ui,
+                                    idx,
                                     &mut self.docs[idx],
                                     is_active,
                                     false,
@@ -1930,6 +1971,9 @@ impl eframe::App for ForgeApp {
                                     self.active_tool,
                                     self.skin,
                                 );
+                                if let Some(d_info) = dt {
+                                    drop_targets.push(d_info);
+                                }
                                 if act != DocWindowAction::None {
                                     pending_action = Some((idx, act));
                                 }
@@ -1955,8 +1999,9 @@ impl eframe::App for ForgeApp {
                         let idx = self.active_tab.min(num_docs - 1);
                         let is_playing_this = is_playing && self.playing_doc_idx == Some(idx);
                         let pf = if is_playing_this { cur_play_frame } else { None };
-                        let act = draw_sound_forge_doc_window(
+                        let (act, dt) = draw_sound_forge_doc_window(
                             ui,
+                            idx,
                             &mut self.docs[idx],
                             true,
                             true,
@@ -1971,8 +2016,87 @@ impl eframe::App for ForgeApp {
                             self.active_tool,
                             self.skin,
                         );
+                        if let Some(d_info) = dt {
+                            drop_targets.push(d_info);
+                        }
                         if act != DocWindowAction::None {
                             pending_action = Some((idx, act));
+                        }
+                    }
+                }
+
+                // Visual Floating Ghost while dragging a clip across MDI windows + Release Drop Handling!
+                if let Some(dragged) = &self.interaction.dragging_clip {
+                    if let Some(pos) = ctx.pointer_latest_pos() {
+                        let dur_tc = format_timecode(dragged.buffer.duration_secs());
+                        egui::Area::new(egui::Id::new("drag_clip_ghost_overlay"))
+                            .order(egui::Order::Tooltip)
+                            .fixed_pos(pos + egui::vec2(14.0, 14.0))
+                            .interactable(false)
+                            .show(ctx, |ui| {
+                                egui::Frame::none()
+                                    .fill(egui::Color32::from_rgba_unmultiplied(20, 90, 180, 235))
+                                    .stroke(egui::Stroke::new(
+                                        1.5_f32,
+                                        egui::Color32::from_rgb(180, 220, 255),
+                                    ))
+                                    .rounding(4.0)
+                                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "🎵 Arrastando '{}' ({dur_tc}) — Solte sobre a música de destino!",
+                                                dragged.src_title
+                                            ))
+                                            .color(egui::Color32::WHITE)
+                                            .strong()
+                                            .size(12.0),
+                                        );
+                                    });
+                            });
+                    }
+                }
+
+                if ctx.input(|i| i.pointer.any_released()) {
+                    self.interaction.drag_candidate = None;
+                    if let Some(dragged) = self.interaction.dragging_clip.take() {
+                        // Also store into clipboard so Ctrl+V / toolbar buttons always have it!
+                        self.clipboard = Some((*dragged.buffer).clone());
+                        self.clipboard_source_title = dragged.src_title.clone();
+
+                        if let Some(pos) = ctx.pointer_latest_pos() {
+                            if let Some(target) = drop_targets
+                                .iter()
+                                .find(|t| t.body_rect.expand(6.0).contains(pos))
+                            {
+                                let drop_x = pos
+                                    .x
+                                    .clamp(target.wave_rect.min.x, target.wave_rect.max.x);
+                                let ratio = ((drop_x - target.wave_rect.min.x)
+                                    / target.wave_rect.width().max(1.0))
+                                    as f64;
+                                let mut drop_f = ((target.view_start
+                                    + ratio * target.view_frames)
+                                    .round() as usize)
+                                    .min(target.total_frames);
+                                if self.snap_zero_crossing {
+                                    if let Some(d) = self.docs.get(target.doc_idx) {
+                                        let sr_win = (d.buffer.sample_rate as usize / 80).max(32);
+                                        drop_f = d.buffer.find_nearest_zero_crossing(drop_f, sr_win);
+                                    }
+                                }
+                                self.active_tab = target.doc_idx;
+                                if let Some(d) = self.docs.get_mut(target.doc_idx) {
+                                    d.cursor_frame = drop_f;
+                                }
+                                self.pending_drop = Some(PendingDropState {
+                                    clip: (*dragged.buffer).clone(),
+                                    src_title: dragged.src_title,
+                                    dst_doc_idx: target.doc_idx,
+                                    dst_frame: drop_f,
+                                    screen_pos: pos,
+                                });
+                            }
                         }
                     }
                 }
@@ -2094,6 +2218,148 @@ impl eframe::App for ForgeApp {
                     }
                 }
             });
+
+        if let Some(drop_state) = self.pending_drop.clone() {
+            let screen = ctx.screen_rect();
+            let pos_x = drop_state
+                .screen_pos
+                .x
+                .clamp(screen.left() + 8.0, (screen.right() - 332.0).max(screen.left() + 8.0));
+            let pos_y = drop_state
+                .screen_pos
+                .y
+                .clamp(screen.top() + 8.0, (screen.bottom() - 230.0).max(screen.top() + 8.0));
+            let mut close_drop = false;
+            let dst_title = self
+                .docs
+                .get(drop_state.dst_doc_idx)
+                .map(|d| d.title.clone())
+                .unwrap_or_else(|| "Destino".to_string());
+            let sr = self
+                .docs
+                .get(drop_state.dst_doc_idx)
+                .map(|d| d.buffer.sample_rate)
+                .unwrap_or(drop_state.clip.sample_rate)
+                .max(1) as f64;
+            let drop_time = format_timecode(drop_state.dst_frame as f64 / sr);
+            let clip_secs = drop_state.clip.duration_secs();
+
+            egui::Window::new("Soltar Trecho de Áudio")
+                .id(egui::Id::new("pending_drop_popup"))
+                .fixed_pos(egui::pos2(pos_x, pos_y))
+                .fixed_size(egui::vec2(320.0, 215.0))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Origem: {} ({:.2}s)",
+                            drop_state.src_title, clip_secs
+                        ))
+                        .strong(),
+                    );
+                    ui.label(format!("Destino: {} em {}", dst_title, drop_time));
+                    ui.separator();
+
+                    if ui.button("📌 Colar / Inserir Aqui").clicked() {
+                        self.stop_playback();
+                        if let Some(doc) = self.docs.get_mut(drop_state.dst_doc_idx) {
+                            let old_len = doc.buffer.num_frames();
+                            let was_fit = doc.view_frames >= old_len.saturating_sub(2) as f64;
+                            let at = drop_state.dst_frame.min(old_len);
+                            let new_buf = insert_buffer(&doc.buffer, at, &drop_state.clip);
+                            let delta = new_buf.num_frames().saturating_sub(old_len);
+                            doc.annotations.adjust_for_edit(at, at, delta);
+                            doc.commit_buffer(new_buf, at, Some((at, at + delta)));
+                            if was_fit {
+                                doc.zoom_fit();
+                            }
+                            self.status_msg = format!("Trecho inserido em {} ({})", dst_title, drop_time);
+                        }
+                        self.active_tab = drop_state.dst_doc_idx;
+                        close_drop = true;
+                    }
+
+                    if ui.button("🔗 Emendar com Crossfade Aqui").clicked() {
+                        self.stop_playback();
+                        if let Some(doc) = self.docs.get_mut(drop_state.dst_doc_idx) {
+                            let total = doc.buffer.num_frames();
+                            let was_fit = doc.view_frames >= total.saturating_sub(2) as f64;
+                            let at = drop_state.dst_frame.min(total);
+                            let new_buf = if at >= total {
+                                concat_with_crossfade(&doc.buffer, &drop_state.clip, 0.25)
+                            } else {
+                                insert_buffer_with_crossfade(&doc.buffer, at, &drop_state.clip, 0.25)
+                            };
+                            let new_len = new_buf.num_frames();
+                            let delta = new_len.saturating_sub(total);
+                            doc.annotations.adjust_for_edit(at, at, delta);
+                            let clip_len_in_dst = ((clip_secs * sr).round() as usize).max(1);
+                            let sel_end = (at + clip_len_in_dst).min(new_len);
+                            doc.commit_buffer(new_buf, at, Some((at, sel_end)));
+                            if was_fit {
+                                doc.zoom_fit();
+                            }
+                            self.status_msg = format!(
+                                "Trecho emendado com crossfade em {} ({})",
+                                dst_title, drop_time
+                            );
+                        }
+                        self.active_tab = drop_state.dst_doc_idx;
+                        close_drop = true;
+                    }
+
+                    if ui.button("🔀 Mesclar (Mix — tocar juntos) Aqui").clicked() {
+                        self.stop_playback();
+                        if let Some(doc) = self.docs.get_mut(drop_state.dst_doc_idx) {
+                            let old_len = doc.buffer.num_frames();
+                            let was_fit = doc.view_frames >= old_len.saturating_sub(2) as f64;
+                            let at = drop_state.dst_frame.min(old_len);
+                            let new_buf = mix_buffer_advanced(
+                                &doc.buffer,
+                                at,
+                                &drop_state.clip,
+                                1.0,
+                                1.0,
+                                0.0,
+                                0.0,
+                            );
+                            let new_len = new_buf.num_frames();
+                            let clip_len_in_dst = ((clip_secs * sr).round() as usize).max(1);
+                            let sel_end = (at + clip_len_in_dst).min(new_len);
+                            doc.commit_buffer(new_buf, at, Some((at, sel_end)));
+                            if was_fit {
+                                doc.zoom_fit();
+                            }
+                            self.status_msg = format!("Trecho mesclado em {} ({})", dst_title, drop_time);
+                        }
+                        self.active_tab = drop_state.dst_doc_idx;
+                        close_drop = true;
+                    }
+
+                    if ui.button("🎛 Mesclar com Ajuste de Volumes...").clicked() {
+                        self.dlg_use_clipboard_source = true;
+                        self.dlg_target_doc_idx = drop_state.dst_doc_idx;
+                        self.dlg_dst_pos_mode = 0;
+                        self.dlg_transfer_mode = 2;
+                        if let Some(doc) = self.docs.get_mut(drop_state.dst_doc_idx) {
+                            doc.cursor_frame = drop_state.dst_frame.min(doc.buffer.num_frames());
+                        }
+                        self.active_tab = drop_state.dst_doc_idx;
+                        self.dialog = ActiveDialog::SendToOtherDoc;
+                        close_drop = true;
+                    }
+
+                    ui.separator();
+                    if ui.button("✖ Cancelar").clicked() {
+                        close_drop = true;
+                    }
+                });
+
+            if close_drop {
+                self.pending_drop = None;
+            }
+        }
 
         self.draw_dialogs(ctx);
     }
@@ -3584,6 +3850,7 @@ impl ForgeApp {
                                     let dst_title = self.docs[dst_i].title.clone();
                                     let dst_doc = &mut self.docs[dst_i];
                                     let old_len = dst_doc.buffer.num_frames();
+                                    let was_fit = dst_doc.view_frames >= old_len.saturating_sub(2) as f64;
                                     let new_len = next_buf.num_frames();
                                     if new_len > old_len {
                                         dst_doc
@@ -3591,6 +3858,9 @@ impl ForgeApp {
                                             .adjust_for_edit(at_f, at_f, new_len - old_len);
                                     }
                                     dst_doc.commit_buffer(next_buf, at_f, Some((at_f, end_f)));
+                                    if was_fit {
+                                        dst_doc.zoom_fit();
+                                    }
                                     self.active_tab = dst_i;
                                     self.status_msg = format!(
                                         "Aplicado trecho de '{src_label}' em '{dst_title}' ({})!",

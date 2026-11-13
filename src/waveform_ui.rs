@@ -1,7 +1,10 @@
+use crate::audio::AudioBuffer;
 use crate::document::AudioDocument;
+use crate::dsp::slice_frames;
 use crate::playback::MeterReading;
 use crate::theme::{amp_to_db, format_ruler_time, format_timecode, ForgeTheme, Palette, UiSkin};
 use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveTool {
@@ -37,6 +40,34 @@ pub enum DocWindowAction {
     ApplyWindowRate,
 }
 
+#[derive(Clone)]
+pub struct DraggedClip {
+    pub src_doc_id: usize,
+    pub src_title: String,
+    pub start_frame: usize,
+    pub end_frame: usize,
+    pub buffer: Arc<AudioBuffer>,
+}
+
+#[derive(Clone, Copy)]
+pub struct DragCandidate {
+    pub doc_id: usize,
+    pub orig_s: usize,
+    pub orig_e: usize,
+    pub start_pos: Pos2,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DropTargetInfo {
+    pub doc_idx: usize,
+    pub doc_id: usize,
+    pub body_rect: Rect,
+    pub wave_rect: Rect,
+    pub view_start: f64,
+    pub view_frames: f64,
+    pub total_frames: usize,
+}
+
 pub struct WaveformInteraction {
     pub drag_doc_id: Option<usize>,
     pub drag_anchor_frame: Option<usize>,
@@ -44,6 +75,9 @@ pub struct WaveformInteraction {
     /// `(doc_id, marker_id)` currently being dragged horizontally
     pub dragging_marker: Option<(usize, usize)>,
     pub pencil_undo_pushed: bool,
+    /// Cross-window selection drag-and-drop clip currently held by the mouse
+    pub dragging_clip: Option<DraggedClip>,
+    pub drag_candidate: Option<DragCandidate>,
 }
 
 impl Default for WaveformInteraction {
@@ -54,14 +88,17 @@ impl Default for WaveformInteraction {
             overview_dragging_doc: None,
             dragging_marker: None,
             pencil_undo_pushed: false,
+            dragging_clip: None,
+            drag_candidate: None,
         }
     }
 }
 
 /// Renders a complete Sound Forge Pro 10.0 MDI Audio Window with independent resizable height/width,
-/// draggable orange markers, and instant click-to-seek/play.
+/// draggable orange markers, cross-window selection drag-and-drop, and instant click-to-seek/play.
 pub fn draw_sound_forge_doc_window(
     ui: &mut Ui,
+    doc_idx: usize,
     doc: &mut AudioDocument,
     is_active: bool,
     is_maximized: bool,
@@ -75,8 +112,9 @@ pub fn draw_sound_forge_doc_window(
     snap_zero_crossing: bool,
     active_tool: ActiveTool,
     skin: UiSkin,
-) -> DocWindowAction {
+) -> (DocWindowAction, Option<DropTargetInfo>) {
     let mut action = DocWindowAction::None;
+    let mut drop_target_info: Option<DropTargetInfo> = None;
     let p = skin.palette();
 
     let max_avail_w = ui.available_width().max(260.0);
@@ -195,71 +233,6 @@ pub fn draw_sound_forge_doc_window(
                                     doc.win_height = (doc.win_height - 45.0).max(115.0);
                                     action = DocWindowAction::Activate;
                                 }
-                            }
-
-                            if has_multiple_docs && doc.selection.is_some() {
-                                if ui
-                                    .small_button("📥 Enviar p/ Outra Janela")
-                                    .on_hover_text(
-                                        "Envia/Cola/Mescla o trecho selecionado desta música diretamente em outra janela aberta",
-                                    )
-                                    .clicked()
-                                {
-                                    action = DocWindowAction::SendSelectionToOtherDoc;
-                                }
-                            }
-
-                            if has_clipboard {
-                                if ui
-                                    .small_button("🔀 Mesclar Aqui...")
-                                    .on_hover_text(
-                                        "Mescla (sobrepõe/mixa) o trecho copiado na posição do cursor desta janela com ajuste de volume e fade",
-                                    )
-                                    .clicked()
-                                {
-                                    action = DocWindowAction::PasteMixHere;
-                                }
-                                if ui
-                                    .small_button("🔗 Colar c/ Crossfade")
-                                    .on_hover_text(
-                                        "Insere o trecho copiado na posição do cursor desta janela com Crossfade suave nas bordas",
-                                    )
-                                    .clicked()
-                                {
-                                    action = DocWindowAction::PasteCrossfadeHere;
-                                }
-                                if ui
-                                    .small_button("📌 Colar Aqui")
-                                    .on_hover_text(
-                                        "Cola (insere) o trecho copiado na posição do cursor desta janela (Ctrl+V)",
-                                    )
-                                    .clicked()
-                                {
-                                    action = DocWindowAction::PasteInsertHere;
-                                }
-                            }
-
-                            if doc.selection.is_some() {
-                                if ui
-                                    .small_button("✂ Recortar")
-                                    .on_hover_text("Recorta o trecho selecionado para colar/mesclar em outra janela (Ctrl+X)")
-                                    .clicked()
-                                {
-                                    action = DocWindowAction::CutSelection;
-                                }
-                                if ui
-                                    .small_button("📋 Copiar Trecho")
-                                    .on_hover_text("Copia o trecho selecionado para colar/mesclar em outra janela (Ctrl+C)")
-                                    .clicked()
-                                {
-                                    action = DocWindowAction::CopySelection;
-                                }
-                            } else if ui
-                                .small_button("📋 Copiar Música")
-                                .on_hover_text("Copia a música inteira desta janela para colar ou mesclar em outra janela")
-                                .clicked()
-                            {
-                                action = DocWindowAction::CopySelection;
                             }
                         });
                     });
@@ -557,14 +530,16 @@ pub fn draw_sound_forge_doc_window(
                 }
             }
 
-            // Draw Selection overlay
+            // Draw Selection overlay + Visible Draggable Clip Pill (`✋ Arraste p/ outra janela`)
             if let Some((s, e)) = doc.selection {
                 let x0 = frame_to_x(s as f64);
                 let x1 = frame_to_x(e as f64);
                 if x1 >= wave_rect.min.x && x0 <= wave_rect.max.x {
+                    let vis_x0 = x0.max(wave_rect.min.x);
+                    let vis_x1 = x1.min(wave_rect.max.x);
                     let sel_rect = Rect::from_min_max(
-                        Pos2::new(x0.max(wave_rect.min.x), wave_rect.min.y),
-                        Pos2::new(x1.min(wave_rect.max.x), wave_rect.max.y),
+                        Pos2::new(vis_x0, wave_rect.min.y),
+                        Pos2::new(vis_x1, wave_rect.max.y),
                     );
                     wave_painter.rect_filled(sel_rect, 0.0, p.selection_fill);
                     wave_painter.line_segment(
@@ -575,6 +550,92 @@ pub fn draw_sound_forge_doc_window(
                         [Pos2::new(x1, wave_rect.min.y), Pos2::new(x1, wave_rect.max.y)],
                         Stroke::new(1.5_f32, p.selection_border),
                     );
+
+                    // Top drag-handle pill so user clearly sees they can drag this selection straight to another window!
+                    let sel_w = (vis_x1 - vis_x0).max(0.0);
+                    if sel_w >= 46.0 {
+                        let pill_w = sel_w.clamp(46.0, 188.0);
+                        let pill_x0 = vis_x0 + (sel_w - pill_w) * 0.5;
+                        let pill_rect = Rect::from_min_size(
+                            Pos2::new(pill_x0, wave_rect.min.y + 3.0),
+                            Vec2::new(pill_w, 16.0),
+                        );
+                        wave_painter.rect_filled(
+                            pill_rect,
+                            3.0,
+                            Color32::from_rgba_unmultiplied(24, 92, 185, 225),
+                        );
+                        wave_painter.rect_stroke(
+                            pill_rect,
+                            3.0,
+                            Stroke::new(1.0_f32, Color32::from_rgb(180, 218, 255)),
+                        );
+                        let label_txt = if pill_w >= 150.0 {
+                            "✋ Arraste p/ outra janela"
+                        } else {
+                            "✋ Arrastar"
+                        };
+                        wave_painter.text(
+                            pill_rect.center(),
+                            Align2::CENTER_CENTER,
+                            label_txt,
+                            FontId::proportional(10.0),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+            }
+
+            // Record DropTargetInfo so cross-window drag & drop can target any window!
+            drop_target_info = Some(DropTargetInfo {
+                doc_idx,
+                doc_id: doc.id,
+                body_rect,
+                wave_rect,
+                view_start,
+                view_frames,
+                total_frames,
+            });
+
+            // Highlight this window visually if the user is dragging a clip over it right now!
+            if interaction.dragging_clip.is_some() {
+                if let Some(ptr) = ui.ctx().pointer_latest_pos() {
+                    if body_rect.expand(4.0).contains(ptr) {
+                        let drop_x = ptr.x.clamp(wave_rect.min.x, wave_rect.max.x);
+                        let ratio = ((drop_x - wave_rect.min.x) / wave_rect.width().max(1.0)) as f64;
+                        let drop_f = ((view_start + ratio * view_frames).round() as usize)
+                            .min(total_frames);
+                        let drop_tc = format_timecode(doc.buffer.frame_to_secs(drop_f));
+
+                        painter.rect_stroke(
+                            body_rect.shrink(1.0),
+                            2.0,
+                            Stroke::new(2.5_f32, Color32::from_rgb(35, 175, 75)),
+                        );
+                        wave_painter.line_segment(
+                            [Pos2::new(drop_x, wave_rect.min.y), Pos2::new(drop_x, wave_rect.max.y)],
+                            Stroke::new(2.5_f32, Color32::from_rgb(35, 195, 80)),
+                        );
+                        let tag_rect = Rect::from_min_size(
+                            Pos2::new(
+                                (drop_x + 6.0).min(wave_rect.max.x - 195.0),
+                                wave_rect.min.y + 6.0,
+                            ),
+                            Vec2::new(190.0, 20.0),
+                        );
+                        wave_painter.rect_filled(
+                            tag_rect,
+                            3.0,
+                            Color32::from_rgba_unmultiplied(20, 130, 52, 235),
+                        );
+                        wave_painter.text(
+                            tag_rect.center(),
+                            Align2::CENTER_CENTER,
+                            format!("⬇ Soltar aqui ({drop_tc})"),
+                            FontId::proportional(11.0),
+                            Color32::WHITE,
+                        );
+                    }
                 }
             }
 
@@ -835,6 +896,65 @@ pub fn draw_sound_forge_doc_window(
                             action = DocWindowAction::OpenTimeStretch;
                         }
 
+                        ui.separator();
+
+                        // Direct left-aligned Copy / Cut / Paste / Crossfade / Mix buttons so they are ALWAYS visible on every window!
+                        if doc.selection.is_some() {
+                            if ui
+                                .small_button("📋 Copiar")
+                                .on_hover_text("Copiar o trecho selecionado desta janela (Ctrl+C)")
+                                .clicked()
+                            {
+                                action = DocWindowAction::CopySelection;
+                            }
+                            if ui
+                                .small_button("✂ Recortar")
+                                .on_hover_text("Recortar o trecho selecionado desta janela (Ctrl+X)")
+                                .clicked()
+                            {
+                                action = DocWindowAction::CutSelection;
+                            }
+                            if has_multiple_docs {
+                                if ui
+                                    .small_button("📥 Enviar/Mesclar...")
+                                    .on_hover_text("Enviar, colar com crossfade ou mesclar este trecho diretamente em outra janela")
+                                    .clicked()
+                                {
+                                    action = DocWindowAction::SendSelectionToOtherDoc;
+                                }
+                            }
+                        } else if ui
+                            .small_button("📋 Copiar Tudo")
+                            .on_hover_text("Copiar a música inteira desta janela (Ctrl+C)")
+                            .clicked()
+                        {
+                            action = DocWindowAction::CopySelection;
+                        }
+
+                        if has_clipboard {
+                            if ui
+                                .small_button("📌 Colar")
+                                .on_hover_text("Colar (inserir) o trecho copiado na posição do cursor desta janela (Ctrl+V)")
+                                .clicked()
+                            {
+                                action = DocWindowAction::PasteInsertHere;
+                            }
+                            if ui
+                                .small_button("🔗 Crossfade")
+                                .on_hover_text("Colar na posição do cursor desta janela com Crossfade suave")
+                                .clicked()
+                            {
+                                action = DocWindowAction::PasteCrossfadeHere;
+                            }
+                            if ui
+                                .small_button("🔀 Mesclar...")
+                                .on_hover_text("Mesclar (sobrepor/mixar) o trecho copiado com esta janela no cursor (Ctrl+M)")
+                                .clicked()
+                            {
+                                action = DocWindowAction::PasteMixHere;
+                            }
+                        }
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Bottom-right corner resize handle (drag to resize height & width simultaneously!)
                             if !is_maximized {
@@ -904,7 +1024,7 @@ pub fn draw_sound_forge_doc_window(
         });
     });
 
-    action
+    (action, drop_target_info)
 }
 
 fn draw_sunken_box(ui: &mut Ui, text: &str, width: f32, p: &Palette) {
@@ -1089,7 +1209,12 @@ fn handle_waveform_and_marker_interactions(
         f.min(total_frames)
     };
 
-    // 1. Check if pointer is hovering or dragging a Marker Flag in `marker_rect` (or ruler)!
+    if interaction.dragging_clip.is_some() {
+        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        return None;
+    }
+
+    // 1. Check if pointer is hovering a Marker Flag or the selection drag pill!
     if let Some(hover_pos) = response.hover_pos() {
         let in_marker_band = marker_rect.contains(hover_pos) || ruler_rect.contains(hover_pos);
         if in_marker_band {
@@ -1099,6 +1224,19 @@ fn handle_waveform_and_marker_interactions(
             });
             if near_marker {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+            }
+        } else if let Some((s, e)) = doc.selection {
+            if e > s {
+                let x0 = frame_to_x(s as f64).max(wave_rect.min.x);
+                let x1 = frame_to_x(e as f64).min(wave_rect.max.x);
+                let in_top_pill = hover_pos.y >= wave_rect.min.y
+                    && hover_pos.y <= wave_rect.min.y + 24.0
+                    && hover_pos.x >= x0
+                    && hover_pos.x <= x1;
+                let alt_or_ctrl = ui.input(|i| i.modifiers.alt || i.modifiers.ctrl);
+                if in_top_pill || (alt_or_ctrl && wave_rect.contains(hover_pos) && hover_pos.x >= x0 && hover_pos.x <= x1) {
+                    ui.ctx().set_cursor_icon(CursorIcon::Grab);
+                }
             }
         }
     }
@@ -1253,6 +1391,42 @@ fn handle_waveform_and_marker_interactions(
     if response.drag_started_by(egui::PointerButton::Primary) {
         if let Some(pos) = response.interact_pointer_pos() {
             if wave_rect.contains(pos) || ruler_rect.contains(pos) {
+                // Check if user grabbed the blue selection pill (`✋ Arraste p/ outra janela`) or Alt/Ctrl+Dragged inside selection!
+                if active_tool == ActiveTool::EditSelect {
+                    if let Some((s, e)) = doc.selection {
+                        if e > s && wave_rect.contains(pos) {
+                            let x0 = frame_to_x(s as f64).max(wave_rect.min.x);
+                            let x1 = frame_to_x(e as f64).min(wave_rect.max.x);
+                            if pos.x >= x0 - 2.0 && pos.x <= x1 + 2.0 {
+                                let in_top_pill = pos.y <= wave_rect.min.y + 24.0;
+                                let mod_drag = ui.input(|i| i.modifiers.alt || i.modifiers.ctrl);
+                                if in_top_pill || mod_drag {
+                                    interaction.dragging_clip = Some(DraggedClip {
+                                        src_doc_id: doc.id,
+                                        src_title: doc.title.clone(),
+                                        start_frame: s,
+                                        end_frame: e,
+                                        buffer: Arc::new(slice_frames(&doc.buffer, s, e)),
+                                    });
+                                    interaction.drag_doc_id = None;
+                                    interaction.drag_anchor_frame = None;
+                                    interaction.drag_candidate = None;
+                                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                                    return None;
+                                } else {
+                                    // Record candidate: if user drags vertically/out of this window towards another window, promote to DraggedClip!
+                                    interaction.drag_candidate = Some(DragCandidate {
+                                        doc_id: doc.id,
+                                        orig_s: s,
+                                        orig_e: e,
+                                        start_pos: pos,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let mut f = x_to_frame(pos.x);
                 if snap_zero_crossing && active_tool == ActiveTool::EditSelect {
                     let search = (doc.buffer.sample_rate as usize / 80).max(32);
@@ -1267,21 +1441,47 @@ fn handle_waveform_and_marker_interactions(
     } else if response.dragged_by(egui::PointerButton::Primary)
         && interaction.drag_doc_id == Some(doc.id)
     {
-        if let (Some(anchor), Some(pos)) = (
-            interaction.drag_anchor_frame,
-            response.interact_pointer_pos(),
-        ) {
-            let mut f = x_to_frame(pos.x);
-            if snap_zero_crossing && active_tool == ActiveTool::EditSelect {
-                let search = (doc.buffer.sample_rate as usize / 80).max(32);
-                f = doc.buffer.find_nearest_zero_crossing(f, search);
+        if let Some(pos) = response
+            .interact_pointer_pos()
+            .or_else(|| ui.ctx().pointer_latest_pos())
+        {
+            if let Some(cand) = interaction.drag_candidate {
+                if cand.doc_id == doc.id {
+                    let delta = pos - cand.start_pos;
+                    let left_wave = !wave_rect.expand(4.0).contains(pos);
+                    let vertical_drag =
+                        delta.y.abs() > 16.0 && delta.y.abs() > delta.x.abs() * 1.15;
+                    if left_wave || vertical_drag {
+                        doc.selection = Some((cand.orig_s, cand.orig_e));
+                        doc.cursor_frame = cand.orig_s;
+                        interaction.dragging_clip = Some(DraggedClip {
+                            src_doc_id: doc.id,
+                            src_title: doc.title.clone(),
+                            start_frame: cand.orig_s,
+                            end_frame: cand.orig_e,
+                            buffer: Arc::new(slice_frames(&doc.buffer, cand.orig_s, cand.orig_e)),
+                        });
+                        interaction.drag_doc_id = None;
+                        interaction.drag_anchor_frame = None;
+                        interaction.drag_candidate = None;
+                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                        return None;
+                    }
+                }
             }
-            if f != anchor {
-                let (s, e) = if anchor < f { (anchor, f) } else { (f, anchor) };
-                doc.selection = Some((s, e));
-                doc.cursor_frame = s;
-            } else {
-                doc.selection = None;
+            if let Some(anchor) = interaction.drag_anchor_frame {
+                let mut f = x_to_frame(pos.x);
+                if snap_zero_crossing && active_tool == ActiveTool::EditSelect {
+                    let search = (doc.buffer.sample_rate as usize / 80).max(32);
+                    f = doc.buffer.find_nearest_zero_crossing(f, search);
+                }
+                if f != anchor {
+                    let (s, e) = if anchor < f { (anchor, f) } else { (f, anchor) };
+                    doc.selection = Some((s, e));
+                    doc.cursor_frame = s;
+                } else {
+                    doc.selection = None;
+                }
             }
         }
     } else if response.drag_stopped() && interaction.drag_doc_id == Some(doc.id) {
@@ -1297,6 +1497,7 @@ fn handle_waveform_and_marker_interactions(
         }
         interaction.drag_doc_id = None;
         interaction.drag_anchor_frame = None;
+        interaction.drag_candidate = None;
     } else if response.clicked_by(egui::PointerButton::Primary) {
         if let Some(pos) = response.interact_pointer_pos() {
             if wave_rect.contains(pos) || ruler_rect.contains(pos) {
