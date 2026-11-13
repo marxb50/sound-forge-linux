@@ -1,6 +1,7 @@
 use crate::audio::AudioBuffer;
-use crate::dsp::{time_stretch_wsola, SpeedMode};
+use crate::dsp::SpeedMode;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::f32::consts::PI;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
@@ -24,22 +25,24 @@ impl Default for MeterReading {
     }
 }
 
+const GRAIN_LEN: usize = 2048;
+
 struct PlaybackShared {
-    /// Original buffer being inspected in the UI.
+    /// Original buffer being inspected in the UI (never pre-cloned/stretched on UI thread!).
     source: Arc<AudioBuffer>,
-    /// Playback buffer (either `source`, or WSOLA pre-stretched when speed != 1.0 && PreservePitch).
-    play_buf: Arc<AudioBuffer>,
     is_playing: bool,
     loop_enabled: bool,
     speed: f64,
     speed_mode: SpeedMode,
-    /// Current fractional frame index in `play_buf`.
+    /// Current fractional frame index in `source` (always accurate in source frames!).
     play_pos: f64,
-    /// Range in `play_buf` frames [range_start, range_end).
+    /// Range in `source` frames [range_start, range_end).
     range_start: usize,
     range_end: usize,
-    /// Ratio to convert `play_buf` frame -> original `source` frame.
-    pos_scale_to_source: f64,
+    /// Dual-grain real-time WSOLA state for pitch-preserving time stretch
+    grain_phase: f64,
+    grain_a_start: f64,
+    grain_b_start: f64,
     meter: MeterReading,
     master_gain: f32,
 }
@@ -47,8 +50,6 @@ struct PlaybackShared {
 pub struct PlaybackEngine {
     shared: Arc<Mutex<PlaybackShared>>,
     _stream: Option<cpal::Stream>,
-    device_sample_rate: u32,
-    device_channels: usize,
     pub init_error: Option<String>,
 }
 
@@ -56,8 +57,7 @@ impl PlaybackEngine {
     pub fn new() -> Self {
         let empty = Arc::new(AudioBuffer::empty(44100, 2));
         let shared = Arc::new(Mutex::new(PlaybackShared {
-            source: empty.clone(),
-            play_buf: empty,
+            source: empty,
             is_playing: false,
             loop_enabled: false,
             speed: 1.0,
@@ -65,32 +65,28 @@ impl PlaybackEngine {
             play_pos: 0.0,
             range_start: 0,
             range_end: 0,
-            pos_scale_to_source: 1.0,
+            grain_phase: 0.0,
+            grain_a_start: 0.0,
+            grain_b_start: 0.0,
             meter: MeterReading::default(),
             master_gain: 1.0,
         }));
 
         match Self::start_stream(shared.clone()) {
-            Ok((stream, sr, ch)) => Self {
+            Ok(stream) => Self {
                 shared,
                 _stream: Some(stream),
-                device_sample_rate: sr,
-                device_channels: ch,
                 init_error: None,
             },
             Err(err) => Self {
                 shared,
                 _stream: None,
-                device_sample_rate: 44100,
-                device_channels: 2,
                 init_error: Some(err),
             },
         }
     }
 
-    fn start_stream(
-        shared: Arc<Mutex<PlaybackShared>>,
-    ) -> Result<(cpal::Stream, u32, usize), String> {
+    fn start_stream(shared: Arc<Mutex<PlaybackShared>>) -> Result<cpal::Stream, String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -120,22 +116,19 @@ impl PlaybackEngine {
             .play()
             .map_err(|e| format!("Falha ao iniciar reprodução de áudio: {e}"))?;
 
-        Ok((stream, sample_rate, channels))
-    }
-
-    pub fn device_info(&self) -> (u32, usize) {
-        (self.device_sample_rate, self.device_channels)
+        Ok(stream)
     }
 
     pub fn set_buffer(&self, buffer: Arc<AudioBuffer>) {
         if let Ok(mut st) = self.shared.lock() {
             st.is_playing = false;
-            st.source = buffer.clone();
-            st.play_buf = buffer;
-            st.play_pos = 0.0;
             st.range_start = 0;
-            st.range_end = st.play_buf.num_frames();
-            st.pos_scale_to_source = 1.0;
+            st.range_end = buffer.num_frames();
+            st.play_pos = 0.0;
+            st.grain_phase = 0.0;
+            st.grain_a_start = 0.0;
+            st.grain_b_start = 0.0;
+            st.source = buffer;
             st.meter = MeterReading::default();
         }
     }
@@ -149,7 +142,7 @@ impl PlaybackEngine {
         speed: f64,
         speed_mode: SpeedMode,
     ) {
-        let speed = speed.clamp(0.25, 4.0);
+        let speed = speed.clamp(0.20, 4.0);
         let src_frames = buffer.num_frames();
         let s = start_frame.min(src_frames);
         let e = end_frame.min(src_frames).max(s);
@@ -157,29 +150,47 @@ impl PlaybackEngine {
             return;
         }
 
-        let (play_buf, range_start, range_end, pos_scale_to_source) =
-            if (speed - 1.0).abs() > 1e-3 && speed_mode == SpeedMode::PreservePitch {
-                // Pre-stretch the source buffer cleanly so pitch stays intact while playing.
-                let stretched = Arc::new(time_stretch_wsola(&buffer, speed));
-                let pf = stretched.num_frames();
-                let ps = ((s as f64 / speed).round() as usize).min(pf);
-                let pe = ((e as f64 / speed).round() as usize).clamp(ps, pf);
-                (stretched, ps, pe, speed)
-            } else {
-                (buffer.clone(), s, e, 1.0)
-            };
-
         if let Ok(mut st) = self.shared.lock() {
             st.source = buffer;
-            st.play_buf = play_buf;
-            st.range_start = range_start;
-            st.range_end = range_end;
-            st.play_pos = range_start as f64;
+            st.range_start = s;
+            st.range_end = e;
+            st.play_pos = s as f64;
+            st.grain_phase = 0.0;
+            st.grain_a_start = s as f64;
+            st.grain_b_start = (s as f64 - (GRAIN_LEN as f64 * 0.5)).max(0.0);
             st.loop_enabled = loop_enabled;
             st.speed = speed;
             st.speed_mode = speed_mode;
-            st.pos_scale_to_source = pos_scale_to_source;
             st.is_playing = true;
+        }
+    }
+
+    /// Instantly jumps playback to `new_start_frame` without stopping or re-allocating.
+    pub fn seek_to_source_frame(&self, new_start_frame: usize, new_end_frame: Option<usize>) {
+        if let Ok(mut st) = self.shared.lock() {
+            let total = st.source.num_frames();
+            if total == 0 {
+                return;
+            }
+            let s = new_start_frame.min(total.saturating_sub(1));
+            let e = new_end_frame
+                .unwrap_or(total)
+                .min(total)
+                .max(s + 1);
+            st.range_start = s;
+            st.range_end = e;
+            st.play_pos = s as f64;
+            st.grain_phase = 0.0;
+            st.grain_a_start = s as f64;
+            st.grain_b_start = (s as f64 - (GRAIN_LEN as f64 * 0.5)).max(0.0);
+        }
+    }
+
+    /// Updates playback speed and mode live while playing!
+    pub fn set_speed_live(&self, speed: f64, speed_mode: SpeedMode) {
+        if let Ok(mut st) = self.shared.lock() {
+            st.speed = speed.clamp(0.20, 4.0);
+            st.speed_mode = speed_mode;
         }
     }
 
@@ -203,12 +214,6 @@ impl PlaybackEngine {
         }
     }
 
-    pub fn set_master_gain(&self, gain: f32) {
-        if let Ok(mut st) = self.shared.lock() {
-            st.master_gain = gain.clamp(0.0, 2.0);
-        }
-    }
-
     pub fn is_playing(&self) -> bool {
         self.shared
             .lock()
@@ -219,8 +224,7 @@ impl PlaybackEngine {
     /// Returns current playhead position in original source frames.
     pub fn current_source_frame(&self) -> usize {
         if let Ok(st) = self.shared.lock() {
-            let f = (st.play_pos * st.pos_scale_to_source).round() as usize;
-            f.min(st.source.num_frames())
+            (st.play_pos.round() as usize).min(st.source.num_frames())
         } else {
             0
         }
@@ -235,6 +239,54 @@ impl PlaybackEngine {
     }
 }
 
+#[inline]
+fn sample_lerp(buf: &AudioBuffer, pos: f64, ch: usize) -> f32 {
+    let n = buf.num_frames();
+    if n == 0 {
+        return 0.0;
+    }
+    let p = pos.clamp(0.0, (n - 1) as f64);
+    let idx0 = p.floor() as usize;
+    let idx1 = (idx0 + 1).min(n - 1);
+    let frac = (p - idx0 as f64) as f32;
+    let a = buf.get_sample(idx0, ch);
+    let b = buf.get_sample(idx1, ch);
+    a + (b - a) * frac
+}
+
+/// Finds a phase-aligned grain start near `target_pos` matching the signal at `ref_pos`.
+fn align_grain_start(buf: &AudioBuffer, target_pos: f64, ref_pos: f64) -> f64 {
+    let n = buf.num_frames();
+    if n < GRAIN_LEN + 256 {
+        return target_pos.clamp(0.0, n.saturating_sub(1) as f64);
+    }
+    let ref_idx = (ref_pos.round() as usize).min(n.saturating_sub(256));
+    let center = (target_pos.round() as usize).min(n.saturating_sub(GRAIN_LEN));
+    let search = 192_usize;
+    let min_c = center.saturating_sub(search);
+    let max_c = (center + search).min(n.saturating_sub(GRAIN_LEN));
+
+    let mut best_c = center;
+    let mut best_dot = f32::NEG_INFINITY;
+    let mut cand = min_c;
+    while cand <= max_c {
+        let mut dot = 0.0_f32;
+        let mut i = 0;
+        while i < 128 {
+            let r = buf.get_sample(ref_idx + i, 0);
+            let x = buf.get_sample(cand + i, 0);
+            dot += r * x;
+            i += 4;
+        }
+        if dot > best_dot {
+            best_dot = dot;
+            best_c = cand;
+        }
+        cand += 4;
+    }
+    best_c as f64
+}
+
 fn fill_audio_callback(
     out: &mut [f32],
     out_channels: usize,
@@ -246,9 +298,8 @@ fn fill_audio_callback(
         return;
     };
 
-    if !st.is_playing || st.range_end <= st.range_start || st.play_buf.num_frames() == 0 {
+    if !st.is_playing || st.range_end <= st.range_start || st.source.num_frames() == 0 {
         out.fill(0.0);
-        // Gentle meter decay when stopped.
         st.meter.peak_l *= 0.85;
         st.meter.peak_r *= 0.85;
         st.meter.rms_l *= 0.85;
@@ -256,19 +307,18 @@ fn fill_audio_callback(
         return;
     }
 
-    let buf = st.play_buf.clone();
+    let buf = st.source.clone();
     let src_sr = buf.sample_rate as f64;
     let src_ch = buf.channels;
     let gain = st.master_gain;
+    let speed = st.speed;
+    let use_wsola = (speed - 1.0).abs() > 1e-3 && st.speed_mode == SpeedMode::PreservePitch;
 
-    // When PreservePitch is active, `play_buf` is already time-stretched, so step at 1.0x!
-    // When Varispeed is active, step proportionally to `st.speed`.
-    let effective_speed = if st.speed_mode == SpeedMode::Varispeed {
-        st.speed
-    } else {
-        1.0
-    };
-    let step = (src_sr / out_sr as f64) * effective_speed;
+    // Rate at which the playhead advances through the song timeline:
+    let timeline_step = (src_sr / out_sr as f64) * speed;
+    // Rate at which audio grains advance (1.0x pitch):
+    let grain_step = src_sr / out_sr as f64;
+    let phase_step = grain_step / GRAIN_LEN as f64;
 
     let out_frames = out.len() / out_channels.max(1);
     let mut peak_l = 0.0_f32;
@@ -281,6 +331,9 @@ fn fill_audio_callback(
         if st.play_pos >= st.range_end as f64 {
             if st.loop_enabled {
                 st.play_pos = st.range_start as f64;
+                st.grain_phase = 0.0;
+                st.grain_a_start = st.play_pos;
+                st.grain_b_start = (st.play_pos - GRAIN_LEN as f64 * 0.5).max(0.0);
             } else {
                 st.is_playing = false;
                 st.play_pos = st.range_start as f64;
@@ -293,21 +346,53 @@ fn fill_audio_callback(
             }
         }
 
-        let idx0 = st.play_pos.floor() as usize;
-        let idx1 = (idx0 + 1).min(buf.num_frames().saturating_sub(1));
-        let frac = (st.play_pos - idx0 as f64) as f32;
-
-        let sample_l = {
-            let a = buf.get_sample(idx0, 0);
-            let b = buf.get_sample(idx1, 0);
-            (a + (b - a) * frac) * gain
-        };
-        let sample_r = if src_ch > 1 {
-            let a = buf.get_sample(idx0, 1);
-            let b = buf.get_sample(idx1, 1);
-            (a + (b - a) * frac) * gain
+        let (sample_l, sample_r) = if !use_wsola {
+            let l = sample_lerp(&buf, st.play_pos, 0) * gain;
+            let r = if src_ch > 1 {
+                sample_lerp(&buf, st.play_pos, 1) * gain
+            } else {
+                l
+            };
+            (l, r)
         } else {
-            sample_l
+            let phi_a = st.grain_phase;
+            let phi_b = (phi_a + 0.5).fract();
+
+            // Complementary Hann weights: w_a + w_b == 1.0 everywhere!
+            let w_a = 0.5 * (1.0 - (2.0 * PI * phi_a as f32).cos());
+            let w_b = 0.5 * (1.0 - (2.0 * PI * phi_b as f32).cos());
+
+            let pos_a = st.grain_a_start + phi_a * GRAIN_LEN as f64;
+            let pos_b = st.grain_b_start + phi_b * GRAIN_LEN as f64;
+
+            let la = sample_lerp(&buf, pos_a, 0);
+            let lb = sample_lerp(&buf, pos_b, 0);
+            let l = (la * w_a + lb * w_b) * gain;
+
+            let r = if src_ch > 1 {
+                let ra = sample_lerp(&buf, pos_a, 1);
+                let rb = sample_lerp(&buf, pos_b, 1);
+                (ra * w_a + rb * w_b) * gain
+            } else {
+                l
+            };
+
+            let prev_phi = st.grain_phase;
+            let next_phi = prev_phi + phase_step;
+            // Did Grain B cross 1.0 -> 0.0 (which happens when phi_a crosses 0.5)?
+            if prev_phi < 0.5 && next_phi >= 0.5 {
+                let cur_a_pos = st.grain_a_start + 0.5 * GRAIN_LEN as f64;
+                st.grain_b_start = align_grain_start(&buf, st.play_pos, cur_a_pos);
+            }
+            if next_phi >= 1.0 {
+                st.grain_phase = next_phi - 1.0;
+                let cur_b_pos = st.grain_b_start + 0.5 * GRAIN_LEN as f64;
+                st.grain_a_start = align_grain_start(&buf, st.play_pos, cur_b_pos);
+            } else {
+                st.grain_phase = next_phi;
+            }
+
+            (l, r)
         };
 
         if sample_l.abs() > 0.999 || sample_r.abs() > 0.999 {
@@ -329,7 +414,7 @@ fn fill_audio_callback(
             out[f * out_channels + c] = v.clamp(-1.0, 1.0);
         }
 
-        st.play_pos += step;
+        st.play_pos += timeline_step;
     }
 
     let denom = out_frames.max(1) as f32;

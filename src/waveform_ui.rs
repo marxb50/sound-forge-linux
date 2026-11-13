@@ -1,7 +1,7 @@
 use crate::document::AudioDocument;
 use crate::playback::MeterReading;
 use crate::theme::{amp_to_db, format_ruler_time, format_timecode, ForgeTheme, Palette, UiSkin};
-use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveTool {
@@ -17,6 +17,8 @@ pub enum ActiveTool {
 pub enum DocWindowAction {
     None,
     Activate,
+    /// User clicked on the waveform or marker: seek immediately if playing (or auto-play if play_on_click is on)
+    SeekOrPlay(usize),
     PlayFrom(usize),
     PlayWindow,
     StopWindow,
@@ -30,6 +32,8 @@ pub struct WaveformInteraction {
     pub drag_doc_id: Option<usize>,
     pub drag_anchor_frame: Option<usize>,
     pub overview_dragging_doc: Option<usize>,
+    /// `(doc_id, marker_id)` currently being dragged horizontally
+    pub dragging_marker: Option<(usize, usize)>,
     pub pencil_undo_pushed: bool,
 }
 
@@ -39,19 +43,21 @@ impl Default for WaveformInteraction {
             drag_doc_id: None,
             drag_anchor_frame: None,
             overview_dragging_doc: None,
+            dragging_marker: None,
             pencil_undo_pushed: false,
         }
     }
 }
 
-/// Renders a complete Sound Forge Pro 10.0 MDI Audio Window (Titlebar + Overview + Left Channel Strip + Waveform + Bottom Mini-Transport & Status Boxes).
+/// Renders a complete Sound Forge Pro 10.0 MDI Audio Window with independent resizable height/width,
+/// draggable orange markers, and instant click-to-seek/play.
 pub fn draw_sound_forge_doc_window(
     ui: &mut Ui,
     doc: &mut AudioDocument,
     is_active: bool,
     is_maximized: bool,
     has_multiple_docs: bool,
-    window_height: f32,
+    override_height: Option<f32>,
     interaction: &mut WaveformInteraction,
     playhead_frame: Option<usize>,
     is_playing_this_doc: bool,
@@ -63,10 +69,18 @@ pub fn draw_sound_forge_doc_window(
     let mut action = DocWindowAction::None;
     let p = skin.palette();
 
+    let max_avail_w = ui.available_width().max(260.0);
+    let target_w = if is_maximized {
+        max_avail_w
+    } else {
+        (max_avail_w * doc.win_width_ratio.clamp(0.35, 1.0)).max(320.0)
+    };
+    let window_height = override_height.unwrap_or_else(|| doc.win_height.clamp(105.0, 720.0));
+
     let outer_frame = egui::Frame::none()
         .fill(p.panel_bg)
         .stroke(Stroke::new(
-            if is_active { 1.5_f32 } else { 1.0_f32 },
+            if is_active { 1.8_f32 } else { 1.0_f32 },
             if is_active {
                 p.selection_border
             } else {
@@ -75,582 +89,685 @@ pub fn draw_sound_forge_doc_window(
         ))
         .rounding(egui::Rounding::same(3.0));
 
-    outer_frame.show(ui, |ui| {
-        // 1. Classic Sound Forge MDI Window Titlebar
-        let title_bg = if is_active {
-            p.win_title_active
-        } else {
-            p.win_title_inactive
-        };
-        egui::Frame::none()
-            .fill(title_bg)
-            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let icon_resp = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new("🟥")
-                                .size(12.0)
-                                .color(Color32::from_rgb(200, 40, 40)),
-                        )
-                        .sense(Sense::click()),
-                    );
-                    let title_resp = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(doc.formatted_title_with_duration())
-                                .strong()
-                                .size(12.5)
-                                .color(p.win_title_text),
-                        )
-                        .sense(Sense::click()),
-                    );
-                    if icon_resp.clicked() || title_resp.clicked() {
-                        action = DocWindowAction::Activate;
-                    }
-                    if title_resp.double_clicked() {
-                        action = DocWindowAction::ToggleMaximize;
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("✕").size(11.0).color(Color32::WHITE),
-                                )
-                                .fill(Color32::from_rgb(196, 56, 48))
-                                .min_size(Vec2::new(22.0, 18.0)),
+    ui.allocate_ui(Vec2::new(target_w, window_height), |ui| {
+        ui.set_max_width(target_w);
+        outer_frame.show(ui, |ui| {
+            ui.set_width(target_w - 4.0);
+            // 1. Classic Sound Forge MDI Window Titlebar
+            let title_bg = if is_active {
+                p.win_title_active
+            } else {
+                p.win_title_inactive
+            };
+            egui::Frame::none()
+                .fill(title_bg)
+                .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let icon_resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("🟥")
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(200, 40, 40)),
                             )
-                            .on_hover_text("Fechar música")
-                            .clicked()
-                        {
-                            action = DocWindowAction::CloseWindow;
+                            .sense(Sense::click()),
+                        );
+                        let title_resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(doc.formatted_title_with_duration())
+                                    .strong()
+                                    .size(12.5)
+                                    .color(p.win_title_text),
+                            )
+                            .sense(Sense::click()),
+                        );
+                        if icon_resp.clicked() || title_resp.clicked() {
+                            action = DocWindowAction::Activate;
                         }
-
-                        let max_lbl = if is_maximized { "❐" } else { "□" };
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new(max_lbl).size(11.0))
-                                    .min_size(Vec2::new(22.0, 18.0)),
-                            )
-                            .on_hover_text("Maximizar / Restaurar janela da música")
-                            .clicked()
-                        {
+                        if title_resp.double_clicked() {
                             action = DocWindowAction::ToggleMaximize;
                         }
 
-                        let min_lbl = if doc.minimized { "▲" } else { "—" };
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new(min_lbl).size(11.0))
-                                    .min_size(Vec2::new(22.0, 18.0)),
-                            )
-                            .on_hover_text("Minimizar / Expandir faixa")
-                            .clicked()
-                        {
-                            doc.minimized = !doc.minimized;
-                            action = DocWindowAction::Activate;
-                        }
-
-                        if has_multiple_docs && doc.selection.is_some() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .button("📥 Enviar Trecho p/ Outra Música")
-                                .on_hover_text(
-                                    "Envia o trecho selecionado desta música diretamente para outra música aberta",
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("✕").size(11.0).color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(196, 56, 48))
+                                    .min_size(Vec2::new(22.0, 18.0)),
                                 )
+                                .on_hover_text("Fechar música")
                                 .clicked()
                             {
-                                action = DocWindowAction::SendSelectionToOtherDoc;
+                                action = DocWindowAction::CloseWindow;
                             }
-                        }
+
+                            let max_lbl = if is_maximized { "❐" } else { "□" };
+                            if ui
+                                .add(
+                                    egui::Button::new(egui::RichText::new(max_lbl).size(11.0))
+                                        .min_size(Vec2::new(22.0, 18.0)),
+                                )
+                                .on_hover_text("Maximizar / Restaurar janela da música")
+                                .clicked()
+                            {
+                                action = DocWindowAction::ToggleMaximize;
+                            }
+
+                            let min_lbl = if doc.minimized { "▲" } else { "—" };
+                            if ui
+                                .add(
+                                    egui::Button::new(egui::RichText::new(min_lbl).size(11.0))
+                                        .min_size(Vec2::new(22.0, 18.0)),
+                                )
+                                .on_hover_text("Minimizar / Expandir faixa")
+                                .clicked()
+                            {
+                                doc.minimized = !doc.minimized;
+                                action = DocWindowAction::Activate;
+                            }
+
+                            if !is_maximized {
+                                if ui
+                                    .small_button("↕+")
+                                    .on_hover_text("Deixar janela mais grossa/alta")
+                                    .clicked()
+                                {
+                                    doc.win_height = (doc.win_height + 45.0).min(720.0);
+                                    action = DocWindowAction::Activate;
+                                }
+                                if ui
+                                    .small_button("↕-")
+                                    .on_hover_text("Deixar janela mais fina/baixa")
+                                    .clicked()
+                                {
+                                    doc.win_height = (doc.win_height - 45.0).max(115.0);
+                                    action = DocWindowAction::Activate;
+                                }
+                            }
+
+                            if has_multiple_docs && doc.selection.is_some() {
+                                if ui
+                                    .button("📥 Enviar p/ Outra Música")
+                                    .on_hover_text(
+                                        "Envia o trecho selecionado desta música diretamente para outra música aberta",
+                                    )
+                                    .clicked()
+                                {
+                                    action = DocWindowAction::SendSelectionToOtherDoc;
+                                }
+                            }
+                        });
                     });
                 });
-            });
 
-        if doc.minimized {
-            return;
-        }
-
-        // 2. Overview Bar + Marker Strip + Waveform + Left Channel Header
-        let body_h = (window_height - 58.0).max(115.0);
-        let avail_w = ui.available_width().max(240.0);
-        let (body_rect, body_resp) =
-            ui.allocate_exact_size(Vec2::new(avail_w, body_h), Sense::click_and_drag());
-
-        if body_resp.clicked() || body_resp.drag_started() {
-            action = DocWindowAction::Activate;
-        }
-
-        let left_strip_w = 48.0;
-        let overview_h = 18.0;
-        let marker_h = 16.0;
-        let ruler_h = 18.0;
-        let header_total_h = overview_h + marker_h + ruler_h;
-
-        let left_header_rect = Rect::from_min_max(
-            body_rect.min,
-            Pos2::new(body_rect.min.x + left_strip_w, body_rect.min.y + header_total_h),
-        );
-        let overview_rect = Rect::from_min_max(
-            Pos2::new(body_rect.min.x + left_strip_w, body_rect.min.y),
-            Pos2::new(body_rect.max.x, body_rect.min.y + overview_h),
-        );
-        let marker_rect = Rect::from_min_max(
-            Pos2::new(body_rect.min.x + left_strip_w, overview_rect.max.y),
-            Pos2::new(body_rect.max.x, overview_rect.max.y + marker_h),
-        );
-        let ruler_rect = Rect::from_min_max(
-            Pos2::new(body_rect.min.x + left_strip_w, marker_rect.max.y),
-            Pos2::new(body_rect.max.x, marker_rect.max.y + ruler_h),
-        );
-        let left_ch_rect = Rect::from_min_max(
-            Pos2::new(body_rect.min.x, ruler_rect.max.y),
-            Pos2::new(body_rect.min.x + left_strip_w, body_rect.max.y),
-        );
-        let wave_rect = Rect::from_min_max(
-            Pos2::new(body_rect.min.x + left_strip_w, ruler_rect.max.y),
-            body_rect.max,
-        );
-
-        let painter = ui.painter_at(body_rect);
-        painter.rect_filled(left_header_rect, 0.0, p.ruler_bg);
-        painter.rect_filled(overview_rect, 0.0, p.toolbar_bg);
-        painter.rect_filled(marker_rect, 0.0, Color32::from_rgb(206, 210, 216));
-        painter.rect_filled(ruler_rect, 0.0, p.ruler_bg);
-        painter.rect_filled(left_ch_rect, 0.0, p.ruler_bg);
-        painter.rect_filled(wave_rect, 0.0, p.canvas_bg);
-        painter.rect_stroke(body_rect, 0.0, Stroke::new(1.0_f32, p.border));
-
-        // Draw padlock & tool icon in left_header_rect (like Screenshot 2!)
-        painter.text(
-            Pos2::new(left_header_rect.min.x + 6.0, left_header_rect.center().y + 4.0),
-            Align2::LEFT_CENTER,
-            "🔒 ┼",
-            FontId::proportional(11.5),
-            p.text_muted,
-        );
-
-        let total_frames = doc.buffer.num_frames();
-        if total_frames == 0 {
-            painter.text(
-                wave_rect.center(),
-                Align2::CENTER_CENTER,
-                "Sem áudio carregado",
-                FontId::proportional(13.0),
-                p.text_muted,
-            );
-            return;
-        }
-
-        // Overview bar interaction & rendering
-        draw_window_overview(
-            &painter,
-            overview_rect,
-            &body_resp,
-            doc,
-            interaction,
-            playhead_frame,
-            &p,
-        );
-
-        // Waveform & Ruler interactions
-        handle_waveform_interactions(
-            ui,
-            &body_resp,
-            wave_rect,
-            ruler_rect,
-            left_ch_rect,
-            doc,
-            interaction,
-            snap_zero_crossing,
-            active_tool,
-        );
-
-        let sr = doc.buffer.sample_rate as f64;
-        let view_start = doc.view_start;
-        let view_frames = doc.view_frames.max(1.0);
-        let view_end = view_start + view_frames;
-        let frame_to_x = |f: f64| -> f32 {
-            let ratio = ((f - view_start) / view_frames) as f32;
-            wave_rect.min.x + ratio * wave_rect.width()
-        };
-
-        // Yellow start triangle on marker_rect (Screenshot 2!)
-        if view_start <= 1.0 {
-            let x0 = wave_rect.min.x;
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    Pos2::new(x0, marker_rect.min.y + 1.0),
-                    Pos2::new(x0 + 9.0, marker_rect.min.y + 1.0),
-                    Pos2::new(x0, marker_rect.max.y - 1.0),
-                ],
-                Color32::from_rgb(245, 205, 20),
-                Stroke::new(1.0_f32, Color32::from_rgb(140, 110, 10)),
-            ));
-        }
-
-        // Time ruler
-        draw_time_ruler(&painter, ruler_rect, view_start, view_end, sr, &frame_to_x, &p);
-
-        // Channels + Left Channel Badges (`[1] [-]` and `[2] [-]` + `-Inf.`)
-        let channels = doc.buffer.channels.max(1);
-        let chan_h = wave_rect.height() / channels as f32;
-        let wave_painter = painter.with_clip_rect(wave_rect);
-
-        for ch in 0..channels {
-            let y0 = wave_rect.min.y + ch as f32 * chan_h;
-            let y1 = y0 + chan_h;
-            let ch_rect = Rect::from_min_max(Pos2::new(wave_rect.min.x, y0), Pos2::new(wave_rect.max.x, y1));
-            let strip_rect = Rect::from_min_max(Pos2::new(left_ch_rect.min.x, y0), Pos2::new(left_ch_rect.max.x, y1));
-
-            let ch_enabled = doc.channel_enabled.get(ch).copied().unwrap_or(true);
-            if !ch_enabled {
-                wave_painter.rect_filled(
-                    ch_rect,
-                    0.0,
-                    Color32::from_rgba_premultiplied(150, 150, 150, 45),
-                );
+            if doc.minimized {
+                return;
             }
 
-            // Left channel strip badge `[1] [-]` / `[2] [-]`
-            let badge_rect = Rect::from_min_size(
-                Pos2::new(strip_rect.min.x + 3.0, strip_rect.min.y + 4.0),
-                Vec2::new(16.0, 15.0),
+            // 2. Overview Bar + Marker Strip + Waveform + Left Channel Header
+            let body_h = (window_height - 66.0).max(60.0);
+            let avail_w = (target_w - 4.0).max(240.0);
+            let (body_rect, body_resp) =
+                ui.allocate_exact_size(Vec2::new(avail_w, body_h), Sense::click_and_drag());
+
+            if body_resp.clicked() || body_resp.drag_started() {
+                action = DocWindowAction::Activate;
+            }
+
+            let left_strip_w = 48.0;
+            let overview_h = 16.0;
+            let marker_h = 16.0;
+            let ruler_h = 17.0;
+            let header_total_h = overview_h + marker_h + ruler_h;
+
+            let left_header_rect = Rect::from_min_max(
+                body_rect.min,
+                Pos2::new(body_rect.min.x + left_strip_w, body_rect.min.y + header_total_h),
             );
-            let minus_rect = Rect::from_min_size(
-                Pos2::new(strip_rect.min.x + 21.0, strip_rect.min.y + 4.0),
-                Vec2::new(13.0, 15.0),
+            let overview_rect = Rect::from_min_max(
+                Pos2::new(body_rect.min.x + left_strip_w, body_rect.min.y),
+                Pos2::new(body_rect.max.x, body_rect.min.y + overview_h),
             );
-            let badge_col = if ch_enabled {
-                p.channel_badge_bg
-            } else {
-                Color32::from_rgb(130, 135, 145)
+            let marker_rect = Rect::from_min_max(
+                Pos2::new(body_rect.min.x + left_strip_w, overview_rect.max.y),
+                Pos2::new(body_rect.max.x, overview_rect.max.y + marker_h),
+            );
+            let ruler_rect = Rect::from_min_max(
+                Pos2::new(body_rect.min.x + left_strip_w, marker_rect.max.y),
+                Pos2::new(body_rect.max.x, marker_rect.max.y + ruler_h),
+            );
+            let left_ch_rect = Rect::from_min_max(
+                Pos2::new(body_rect.min.x, ruler_rect.max.y),
+                Pos2::new(body_rect.min.x + left_strip_w, body_rect.max.y),
+            );
+            let wave_rect = Rect::from_min_max(
+                Pos2::new(body_rect.min.x + left_strip_w, ruler_rect.max.y),
+                body_rect.max,
+            );
+
+            let painter = ui.painter_at(body_rect);
+            painter.rect_filled(left_header_rect, 0.0, p.ruler_bg);
+            painter.rect_filled(overview_rect, 0.0, p.toolbar_bg);
+            painter.rect_filled(marker_rect, 0.0, Color32::from_rgb(206, 210, 216));
+            painter.rect_filled(ruler_rect, 0.0, p.ruler_bg);
+            painter.rect_filled(left_ch_rect, 0.0, p.ruler_bg);
+            painter.rect_filled(wave_rect, 0.0, p.canvas_bg);
+            painter.rect_stroke(body_rect, 0.0, Stroke::new(1.0_f32, p.border));
+
+            painter.text(
+                Pos2::new(left_header_rect.min.x + 6.0, left_header_rect.center().y + 4.0),
+                Align2::LEFT_CENTER,
+                "🔒 ┼",
+                FontId::proportional(11.5),
+                p.text_muted,
+            );
+
+            let total_frames = doc.buffer.num_frames();
+            if total_frames == 0 {
+                painter.text(
+                    wave_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Sem áudio carregado",
+                    FontId::proportional(13.0),
+                    p.text_muted,
+                );
+                return;
+            }
+
+            // Overview bar interaction & rendering
+            draw_window_overview(
+                &painter,
+                overview_rect,
+                &body_resp,
+                doc,
+                interaction,
+                playhead_frame,
+                &p,
+            );
+
+            // Waveform, Marker Dragging & Ruler interactions
+            if let Some(seek_frame) = handle_waveform_and_marker_interactions(
+                ui,
+                &body_resp,
+                wave_rect,
+                marker_rect,
+                ruler_rect,
+                left_ch_rect,
+                doc,
+                interaction,
+                snap_zero_crossing,
+                active_tool,
+            ) {
+                action = DocWindowAction::SeekOrPlay(seek_frame);
+            }
+
+            let sr = doc.buffer.sample_rate as f64;
+            let view_start = doc.view_start;
+            let view_frames = doc.view_frames.max(1.0);
+            let view_end = view_start + view_frames;
+            let frame_to_x = |f: f64| -> f32 {
+                let ratio = ((f - view_start) / view_frames) as f32;
+                wave_rect.min.x + ratio * wave_rect.width()
             };
-            painter.rect_filled(badge_rect, 2.0, badge_col);
-            painter.text(
-                badge_rect.center(),
-                Align2::CENTER_CENTER,
-                format!("{}", ch + 1),
-                FontId::monospace(10.5),
-                Color32::WHITE,
-            );
-            painter.rect_filled(minus_rect, 2.0, badge_col);
-            painter.text(
-                minus_rect.center(),
-                Align2::CENTER_CENTER,
-                "-",
-                FontId::monospace(11.0),
-                Color32::WHITE,
+
+            // Yellow start triangle on marker_rect
+            if view_start <= 1.0 {
+                let x0 = wave_rect.min.x;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        Pos2::new(x0, marker_rect.min.y + 1.0),
+                        Pos2::new(x0 + 9.0, marker_rect.min.y + 1.0),
+                        Pos2::new(x0, marker_rect.max.y - 1.0),
+                    ],
+                    Color32::from_rgb(245, 205, 20),
+                    Stroke::new(1.0_f32, Color32::from_rgb(140, 110, 10)),
+                ));
+            }
+
+            // Time ruler
+            draw_time_ruler(
+                &painter,
+                ruler_rect,
+                view_start,
+                view_end,
+                sr,
+                &frame_to_x,
+                &p,
             );
 
-            let mid_y = ch_rect.center().y;
-            let half_h = (ch_rect.height() * 0.45).max(4.0);
+            // Channels + Left Channel Badges (`[1] [-]` and `[2] [-]` + `-Inf.`)
+            let channels = doc.buffer.channels.max(1);
+            let chan_h = wave_rect.height() / channels as f32;
+            let wave_painter = painter.with_clip_rect(wave_rect);
 
-            // `-Inf.` label at zero line on the left strip (Screenshot 1 & 2!)
-            painter.text(
-                Pos2::new(strip_rect.max.x - 3.0, mid_y),
-                Align2::RIGHT_CENTER,
-                "-Inf.",
-                FontId::proportional(9.5),
-                p.text_main,
-            );
-            painter.line_segment(
-                [
-                    Pos2::new(strip_rect.max.x - 1.0, strip_rect.min.y),
-                    Pos2::new(strip_rect.max.x - 1.0, strip_rect.max.y),
-                ],
-                Stroke::new(1.0_f32, p.border),
-            );
+            for ch in 0..channels {
+                let y0 = wave_rect.min.y + ch as f32 * chan_h;
+                let y1 = y0 + chan_h;
+                let ch_rect =
+                    Rect::from_min_max(Pos2::new(wave_rect.min.x, y0), Pos2::new(wave_rect.max.x, y1));
+                let strip_rect = Rect::from_min_max(
+                    Pos2::new(left_ch_rect.min.x, y0),
+                    Pos2::new(left_ch_rect.max.x, y1),
+                );
 
-            // Subtle top/bottom peak boundary lines & zero line
-            wave_painter.line_segment(
-                [
-                    Pos2::new(ch_rect.min.x, mid_y - half_h),
-                    Pos2::new(ch_rect.max.x, mid_y - half_h),
-                ],
-                Stroke::new(1.0_f32, p.grid_major),
-            );
-            wave_painter.line_segment(
-                [
-                    Pos2::new(ch_rect.min.x, mid_y + half_h),
-                    Pos2::new(ch_rect.max.x, mid_y + half_h),
-                ],
-                Stroke::new(1.0_f32, p.grid_major),
-            );
-            wave_painter.line_segment(
-                [Pos2::new(ch_rect.min.x, mid_y), Pos2::new(ch_rect.max.x, mid_y)],
-                Stroke::new(1.0_f32, p.grid_zero),
-            );
+                let ch_enabled = doc.channel_enabled.get(ch).copied().unwrap_or(true);
+                if !ch_enabled {
+                    wave_painter.rect_filled(
+                        ch_rect,
+                        0.0,
+                        Color32::from_rgba_premultiplied(150, 150, 150, 45),
+                    );
+                }
 
-            if ch + 1 < channels {
+                let badge_rect = Rect::from_min_size(
+                    Pos2::new(strip_rect.min.x + 3.0, strip_rect.min.y + 2.0),
+                    Vec2::new(15.0, 14.0),
+                );
+                let minus_rect = Rect::from_min_size(
+                    Pos2::new(strip_rect.min.x + 20.0, strip_rect.min.y + 2.0),
+                    Vec2::new(12.0, 14.0),
+                );
+                let badge_col = if ch_enabled {
+                    p.channel_badge_bg
+                } else {
+                    Color32::from_rgb(130, 135, 145)
+                };
+                painter.rect_filled(badge_rect, 2.0, badge_col);
+                painter.text(
+                    badge_rect.center(),
+                    Align2::CENTER_CENTER,
+                    format!("{}", ch + 1),
+                    FontId::monospace(10.0),
+                    Color32::WHITE,
+                );
+                painter.rect_filled(minus_rect, 2.0, badge_col);
+                painter.text(
+                    minus_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "-",
+                    FontId::monospace(10.5),
+                    Color32::WHITE,
+                );
+
+                let mid_y = ch_rect.center().y;
+                let half_h = (ch_rect.height() * 0.45 * doc.amp_zoom.clamp(0.2, 4.0)).max(2.0);
+                let clip_half_h = (ch_rect.height() * 0.48).max(2.0);
+
+                painter.text(
+                    Pos2::new(strip_rect.max.x - 3.0, mid_y),
+                    Align2::RIGHT_CENTER,
+                    "-Inf.",
+                    FontId::proportional(9.0),
+                    p.text_main,
+                );
                 painter.line_segment(
                     [
-                        Pos2::new(body_rect.min.x, ch_rect.max.y),
-                        Pos2::new(body_rect.max.x, ch_rect.max.y),
+                        Pos2::new(strip_rect.max.x - 1.0, strip_rect.min.y),
+                        Pos2::new(strip_rect.max.x - 1.0, strip_rect.max.y),
                     ],
                     Stroke::new(1.0_f32, p.border),
                 );
+
+                wave_painter.line_segment(
+                    [Pos2::new(ch_rect.min.x, mid_y), Pos2::new(ch_rect.max.x, mid_y)],
+                    Stroke::new(1.0_f32, p.grid_zero),
+                );
+
+                if ch + 1 < channels {
+                    painter.line_segment(
+                        [
+                            Pos2::new(body_rect.min.x, ch_rect.max.y),
+                            Pos2::new(body_rect.max.x, ch_rect.max.y),
+                        ],
+                        Stroke::new(1.0_f32, p.border),
+                    );
+                }
+
+                let px_width = wave_rect.width().ceil().max(1.0) as usize;
+                let frames_per_px = view_frames / px_width as f64;
+                let wave_col = if ch_enabled {
+                    p.wave_fill
+                } else {
+                    Color32::from_rgb(130, 140, 165)
+                };
+
+                if frames_per_px <= 1.2 {
+                    let s_f = (view_start.floor() as usize).saturating_sub(1);
+                    let e_f = ((view_end.ceil() as usize) + 2).min(total_frames);
+                    let mut pts = Vec::with_capacity(e_f.saturating_sub(s_f));
+                    for f in s_f..e_f {
+                        let x = frame_to_x(f as f64);
+                        let s = doc.buffer.get_sample(f, ch).clamp(-1.0, 1.0);
+                        let dy = (s * half_h).clamp(-clip_half_h, clip_half_h);
+                        pts.push(Pos2::new(x, mid_y - dy));
+                    }
+                    if pts.len() >= 2 {
+                        wave_painter.add(egui::Shape::line(pts, Stroke::new(1.5_f32, wave_col)));
+                    }
+                } else {
+                    for px in 0..px_width {
+                        let f0 = ((view_start + px as f64 * frames_per_px).floor() as usize)
+                            .min(total_frames);
+                        let f1 = ((view_start + (px + 1) as f64 * frames_per_px).ceil() as usize)
+                            .clamp(f0 + 1, total_frames);
+                        if f0 >= total_frames {
+                            break;
+                        }
+                        let (min_v, max_v) = doc.pyramid.query_range(&doc.buffer, ch, f0, f1);
+                        let x = wave_rect.min.x + px as f32 + 0.5;
+                        let dy_top = (max_v.clamp(-1.0, 1.0) * half_h).clamp(-clip_half_h, clip_half_h);
+                        let dy_bot = (min_v.clamp(-1.0, 1.0) * half_h).clamp(-clip_half_h, clip_half_h);
+                        let y_top = mid_y - dy_top;
+                        let y_bot = mid_y - dy_bot;
+
+                        wave_painter.line_segment(
+                            [Pos2::new(x, y_top), Pos2::new(x, y_bot.max(y_top + 1.0))],
+                            Stroke::new(1.0_f32, wave_col),
+                        );
+                    }
+                }
             }
 
-            // Draw waveform peaks (Deep Navy Blue in Classic Sound Forge 10!)
-            let px_width = wave_rect.width().ceil().max(1.0) as usize;
-            let frames_per_px = view_frames / px_width as f64;
-            let wave_col = if ch_enabled {
-                p.wave_fill
-            } else {
-                Color32::from_rgb(130, 140, 165)
-            };
-
-            if frames_per_px <= 1.2 {
-                let s_f = (view_start.floor() as usize).saturating_sub(1);
-                let e_f = ((view_end.ceil() as usize) + 2).min(total_frames);
-                let mut pts = Vec::with_capacity(e_f.saturating_sub(s_f));
-                for f in s_f..e_f {
-                    let x = frame_to_x(f as f64);
-                    let s = doc.buffer.get_sample(f, ch).clamp(-1.0, 1.0);
-                    let y = mid_y - s * half_h;
-                    pts.push(Pos2::new(x, y));
-                }
-                if pts.len() >= 2 {
-                    wave_painter.add(egui::Shape::line(pts, Stroke::new(1.5_f32, wave_col)));
-                }
-            } else {
-                for px in 0..px_width {
-                    let f0 = ((view_start + px as f64 * frames_per_px).floor() as usize)
-                        .min(total_frames);
-                    let f1 = ((view_start + (px + 1) as f64 * frames_per_px).ceil() as usize)
-                        .clamp(f0 + 1, total_frames);
-                    if f0 >= total_frames {
-                        break;
-                    }
-                    let (min_v, max_v) = doc.pyramid.query_range(&doc.buffer, ch, f0, f1);
-                    let x = wave_rect.min.x + px as f32 + 0.5;
-                    let y_top = mid_y - max_v.clamp(-1.0, 1.0) * half_h;
-                    let y_bot = mid_y - min_v.clamp(-1.0, 1.0) * half_h;
-
+            // Draw Regions
+            for reg in &doc.annotations.regions {
+                let x0 = frame_to_x(reg.start_frame as f64);
+                let x1 = frame_to_x(reg.end_frame as f64);
+                if x1 >= wave_rect.min.x && x0 <= wave_rect.max.x {
+                    let r_rect = Rect::from_min_max(
+                        Pos2::new(x0.max(wave_rect.min.x), wave_rect.min.y),
+                        Pos2::new(x1.min(wave_rect.max.x), wave_rect.max.y),
+                    );
+                    wave_painter.rect_filled(r_rect, 0.0, p.region_fill);
                     wave_painter.line_segment(
-                        [Pos2::new(x, y_top), Pos2::new(x, y_bot.max(y_top + 1.0))],
-                        Stroke::new(1.0_f32, wave_col),
+                        [Pos2::new(x0, wave_rect.min.y), Pos2::new(x0, wave_rect.max.y)],
+                        Stroke::new(1.0_f32, p.region_border),
+                    );
+                    wave_painter.line_segment(
+                        [Pos2::new(x1, wave_rect.min.y), Pos2::new(x1, wave_rect.max.y)],
+                        Stroke::new(1.0_f32, p.region_border),
                     );
                 }
             }
-        }
 
-        // Draw Regions
-        for reg in &doc.annotations.regions {
-            let x0 = frame_to_x(reg.start_frame as f64);
-            let x1 = frame_to_x(reg.end_frame as f64);
-            if x1 >= wave_rect.min.x && x0 <= wave_rect.max.x {
-                let r_rect = Rect::from_min_max(
-                    Pos2::new(x0.max(wave_rect.min.x), wave_rect.min.y),
-                    Pos2::new(x1.min(wave_rect.max.x), wave_rect.max.y),
-                );
-                wave_painter.rect_filled(r_rect, 0.0, p.region_fill);
-                wave_painter.line_segment(
-                    [Pos2::new(x0, wave_rect.min.y), Pos2::new(x0, wave_rect.max.y)],
-                    Stroke::new(1.0_f32, p.region_border),
-                );
-                wave_painter.line_segment(
-                    [Pos2::new(x1, wave_rect.min.y), Pos2::new(x1, wave_rect.max.y)],
-                    Stroke::new(1.0_f32, p.region_border),
-                );
-            }
-        }
-
-        // Draw Selection overlay
-        if let Some((s, e)) = doc.selection {
-            let x0 = frame_to_x(s as f64);
-            let x1 = frame_to_x(e as f64);
-            if x1 >= wave_rect.min.x && x0 <= wave_rect.max.x {
-                let sel_rect = Rect::from_min_max(
-                    Pos2::new(x0.max(wave_rect.min.x), wave_rect.min.y),
-                    Pos2::new(x1.min(wave_rect.max.x), wave_rect.max.y),
-                );
-                wave_painter.rect_filled(sel_rect, 0.0, p.selection_fill);
-                wave_painter.line_segment(
-                    [Pos2::new(x0, wave_rect.min.y), Pos2::new(x0, wave_rect.max.y)],
-                    Stroke::new(1.5_f32, p.selection_border),
-                );
-                wave_painter.line_segment(
-                    [Pos2::new(x1, wave_rect.min.y), Pos2::new(x1, wave_rect.max.y)],
-                    Stroke::new(1.5_f32, p.selection_border),
-                );
-            }
-        }
-
-        // Draw Orange Numbered Markers (`1`, `2`, `3` in marker_rect + orange vertical line in wave_rect, like Screenshot 1!)
-        let marker_painter = painter.with_clip_rect(marker_rect);
-        for (idx, m) in doc.annotations.markers.iter().enumerate() {
-            let x = frame_to_x(m.frame as f64);
-            if x >= wave_rect.min.x - 12.0 && x <= wave_rect.max.x + 12.0 {
-                wave_painter.line_segment(
-                    [Pos2::new(x, ruler_rect.min.y), Pos2::new(x, wave_rect.max.y)],
-                    Stroke::new(1.2_f32, p.marker),
-                );
-                let sq = Rect::from_min_size(
-                    Pos2::new(x, marker_rect.min.y + 1.0),
-                    Vec2::new(15.0, marker_rect.height() - 2.0),
-                );
-                marker_painter.rect_filled(sq, 1.5, p.marker);
-                marker_painter.text(
-                    sq.center(),
-                    Align2::CENTER_CENTER,
-                    format!("{}", idx + 1),
-                    FontId::proportional(10.0),
-                    Color32::WHITE,
-                );
-            }
-        }
-
-        // Draw Edit Cursor
-        let cur_x = frame_to_x(doc.cursor_frame as f64);
-        if cur_x >= wave_rect.min.x && cur_x <= wave_rect.max.x {
-            wave_painter.line_segment(
-                [Pos2::new(cur_x, wave_rect.min.y), Pos2::new(cur_x, wave_rect.max.y)],
-                Stroke::new(1.2_f32, p.cursor),
-            );
-        }
-
-        // Draw Live Playhead
-        if let Some(pf) = playhead_frame {
-            let px = frame_to_x(pf as f64);
-            if px >= wave_rect.min.x && px <= wave_rect.max.x {
-                wave_painter.line_segment(
-                    [Pos2::new(px, wave_rect.min.y), Pos2::new(px, wave_rect.max.y)],
-                    Stroke::new(2.0_f32, p.playhead),
-                );
-            }
-        }
-
-        // Right-click context menu on waveform
-        body_resp.context_menu(|ui| {
-            if ui.button("▶ Tocar daqui").clicked() {
-                action = DocWindowAction::PlayFrom(doc.cursor_frame);
-                ui.close_menu();
-            }
-            if ui.button("🚩 Inserir Marcador aqui (M)").clicked() {
-                doc.annotations.add_marker(doc.cursor_frame, None);
-                ui.close_menu();
-            }
+            // Draw Selection overlay
             if let Some((s, e)) = doc.selection {
-                if ui.button("📏 Criar Região da Seleção (R)").clicked() {
-                    doc.annotations.add_region(s, e, None);
+                let x0 = frame_to_x(s as f64);
+                let x1 = frame_to_x(e as f64);
+                if x1 >= wave_rect.min.x && x0 <= wave_rect.max.x {
+                    let sel_rect = Rect::from_min_max(
+                        Pos2::new(x0.max(wave_rect.min.x), wave_rect.min.y),
+                        Pos2::new(x1.min(wave_rect.max.x), wave_rect.max.y),
+                    );
+                    wave_painter.rect_filled(sel_rect, 0.0, p.selection_fill);
+                    wave_painter.line_segment(
+                        [Pos2::new(x0, wave_rect.min.y), Pos2::new(x0, wave_rect.max.y)],
+                        Stroke::new(1.5_f32, p.selection_border),
+                    );
+                    wave_painter.line_segment(
+                        [Pos2::new(x1, wave_rect.min.y), Pos2::new(x1, wave_rect.max.y)],
+                        Stroke::new(1.5_f32, p.selection_border),
+                    );
+                }
+            }
+
+            // Draw Orange Numbered Markers (`1`, `2`, `3` in marker_rect + orange vertical line in wave_rect)
+            let marker_painter = painter.with_clip_rect(marker_rect);
+            for (idx, m) in doc.annotations.markers.iter().enumerate() {
+                let x = frame_to_x(m.frame as f64);
+                let is_being_dragged = interaction.dragging_marker == Some((doc.id, m.id));
+                let m_col = if is_being_dragged {
+                    Color32::from_rgb(255, 60, 20)
+                } else {
+                    p.marker
+                };
+                if x >= wave_rect.min.x - 16.0 && x <= wave_rect.max.x + 16.0 {
+                    wave_painter.line_segment(
+                        [Pos2::new(x, ruler_rect.min.y), Pos2::new(x, wave_rect.max.y)],
+                        Stroke::new(if is_being_dragged { 2.0_f32 } else { 1.2_f32 }, m_col),
+                    );
+                    let sq = Rect::from_min_size(
+                        Pos2::new(x - 1.0, marker_rect.min.y + 1.0),
+                        Vec2::new(16.0, marker_rect.height() - 2.0),
+                    );
+                    marker_painter.rect_filled(sq, 1.5, m_col);
+                    marker_painter.text(
+                        sq.center(),
+                        Align2::CENTER_CENTER,
+                        format!("{}", idx + 1),
+                        FontId::proportional(10.0),
+                        Color32::WHITE,
+                    );
+                }
+            }
+
+            // Draw Edit Cursor
+            let cur_x = frame_to_x(doc.cursor_frame as f64);
+            if cur_x >= wave_rect.min.x && cur_x <= wave_rect.max.x {
+                wave_painter.line_segment(
+                    [Pos2::new(cur_x, wave_rect.min.y), Pos2::new(cur_x, wave_rect.max.y)],
+                    Stroke::new(1.2_f32, p.cursor),
+                );
+            }
+
+            // Draw Live Playhead
+            if let Some(pf) = playhead_frame {
+                let px = frame_to_x(pf as f64);
+                if px >= wave_rect.min.x && px <= wave_rect.max.x {
+                    wave_painter.line_segment(
+                        [Pos2::new(px, wave_rect.min.y), Pos2::new(px, wave_rect.max.y)],
+                        Stroke::new(2.0_f32, p.playhead),
+                    );
+                }
+            }
+
+            // Right-click context menu on waveform / markers
+            body_resp.context_menu(|ui| {
+                if ui.button("▶ Tocar daqui").clicked() {
+                    action = DocWindowAction::PlayFrom(doc.cursor_frame);
                     ui.close_menu();
                 }
-                if has_multiple_docs {
-                    if ui.button("📥 Enviar Seleção para Outra Música...").clicked() {
-                        action = DocWindowAction::SendSelectionToOtherDoc;
+                if ui.button("🚩 Inserir Marcador aqui (M)").clicked() {
+                    doc.annotations.add_marker(doc.cursor_frame, None);
+                    ui.close_menu();
+                }
+                if !doc.annotations.markers.is_empty() {
+                    ui.menu_button("🚩 Excluir Marcador...", |ui| {
+                        let mut del_id = None;
+                        for (i, m) in doc.annotations.markers.iter().enumerate() {
+                            let t = format_timecode(doc.buffer.frame_to_secs(m.frame));
+                            if ui.button(format!("Excluir #{} ({t})", i + 1)).clicked() {
+                                del_id = Some(m.id);
+                                ui.close_menu();
+                            }
+                        }
+                        if let Some(id) = del_id {
+                            doc.annotations.remove_marker(id);
+                        }
+                    });
+                }
+                if let Some((s, e)) = doc.selection {
+                    if ui.button("📏 Criar Região da Seleção (R)").clicked() {
+                        doc.annotations.add_region(s, e, None);
+                        ui.close_menu();
+                    }
+                    if has_multiple_docs {
+                        if ui.button("📥 Enviar Seleção para Outra Música...").clicked() {
+                            action = DocWindowAction::SendSelectionToOtherDoc;
+                            ui.close_menu();
+                        }
+                    }
+                    if ui.button("🔍 Zoom na Seleção").clicked() {
+                        doc.zoom_selection();
                         ui.close_menu();
                     }
                 }
-                if ui.button("🔍 Zoom na Seleção").clicked() {
-                    doc.zoom_selection();
+                if ui.button("↔ Mostrar Música Inteira (Fit All)").clicked() {
+                    doc.zoom_fit();
                     ui.close_menu();
                 }
-            }
-            if ui.button("↔ Mostrar Música Inteira (Fit All)").clicked() {
-                doc.zoom_fit();
-                ui.close_menu();
-            }
-        });
+            });
 
-        // 3. Per-Window Bottom Mini-Transport + Rate Slider + 3 Sunken Status Boxes (Screenshot 1!)
-        egui::Frame::none()
-            .fill(p.toolbar_bg)
-            .inner_margin(egui::Margin::symmetric(4.0, 2.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .small_button("|◀")
-                        .on_hover_text("Ir para o início")
-                        .clicked()
-                    {
-                        doc.cursor_frame = 0;
-                        action = DocWindowAction::Activate;
-                    }
-                    if ui
-                        .small_button("◀◀")
-                        .on_hover_text("Retroceder 2 segundos")
-                        .clicked()
-                    {
-                        let step = doc.buffer.sample_rate as usize * 2;
-                        doc.cursor_frame = doc.cursor_frame.saturating_sub(step);
-                        action = DocWindowAction::Activate;
-                    }
-                    if ui.small_button("■").on_hover_text("Parar").clicked() {
-                        action = DocWindowAction::StopWindow;
-                    }
-                    let play_txt = if is_playing_this_doc { "⏸" } else { "▶" };
-                    if ui
-                        .small_button(play_txt)
-                        .on_hover_text("Tocar esta música")
-                        .clicked()
-                    {
-                        action = DocWindowAction::PlayWindow;
-                    }
-                    let loop_btn = egui::Button::new(
-                        egui::RichText::new("🔁").size(11.0).color(if loop_enabled {
-                            ForgeTheme::ACCENT_GREEN
-                        } else {
-                            p.text_main
-                        }),
-                    );
-                    if ui
-                        .add(loop_btn)
-                        .on_hover_text("Tocar em Loop")
-                        .clicked()
-                    {
-                        action = DocWindowAction::ToggleLoopPlay;
-                    }
+            // 3. Per-Window Bottom Mini-Transport + Rate Slider + 3 Sunken Status Boxes + Resize Grips
+            egui::Frame::none()
+                .fill(p.toolbar_bg)
+                .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // Vertical waveform thickness buttons (`-` / `+` on bottom left like Screenshot 1!)
+                        if ui
+                            .small_button("—")
+                            .on_hover_text("Deixar desenho da onda mais fino")
+                            .clicked()
+                        {
+                            doc.amp_zoom = (doc.amp_zoom * 0.8).clamp(0.2, 4.0);
+                        }
+                        if ui
+                            .small_button("+")
+                            .on_hover_text("Deixar desenho da onda mais grosso")
+                            .clicked()
+                        {
+                            doc.amp_zoom = (doc.amp_zoom * 1.25).clamp(0.2, 4.0);
+                        }
+                        ui.separator();
 
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("┼")
-                            .color(ForgeTheme::ACCENT_GREEN)
-                            .strong(),
-                    );
-                    if ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("Rate: {:+.2}", doc.rate_slider))
-                                    .size(11.0),
+                        if ui
+                            .small_button("|◀")
+                            .on_hover_text("Ir para o início")
+                            .clicked()
+                        {
+                            doc.cursor_frame = 0;
+                            action = DocWindowAction::SeekOrPlay(0);
+                        }
+                        if ui
+                            .small_button("◀◀")
+                            .on_hover_text("Retroceder 2 segundos")
+                            .clicked()
+                        {
+                            let step = doc.buffer.sample_rate as usize * 2;
+                            doc.cursor_frame = doc.cursor_frame.saturating_sub(step);
+                            action = DocWindowAction::SeekOrPlay(doc.cursor_frame);
+                        }
+                        if ui.small_button("■").on_hover_text("Parar").clicked() {
+                            action = DocWindowAction::StopWindow;
+                        }
+                        let play_txt = if is_playing_this_doc { "⏸" } else { "▶" };
+                        if ui
+                            .small_button(play_txt)
+                            .on_hover_text("Tocar esta música")
+                            .clicked()
+                        {
+                            action = DocWindowAction::PlayWindow;
+                        }
+                        let loop_btn = egui::Button::new(
+                            egui::RichText::new("🔁").size(11.0).color(if loop_enabled {
+                                ForgeTheme::ACCENT_GREEN
+                            } else {
+                                p.text_main
+                            }),
+                        );
+                        if ui
+                            .add(loop_btn)
+                            .on_hover_text("Tocar em Loop")
+                            .clicked()
+                        {
+                            action = DocWindowAction::ToggleLoopPlay;
+                        }
+
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("┼")
+                                .color(ForgeTheme::ACCENT_GREEN)
+                                .strong(),
+                        );
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("Rate: {:+.2}", doc.rate_slider))
+                                        .size(11.0),
+                                )
+                                .sense(Sense::click()),
                             )
-                            .sense(Sense::click()),
+                            .on_hover_text("Clique para zerar Rate (0,00)")
+                            .clicked()
+                        {
+                            doc.rate_slider = 0.0;
+                        }
+                        ui.add(
+                            egui::Slider::new(&mut doc.rate_slider, -12.0..=12.0)
+                                .show_value(false)
+                                .trailing_fill(false),
                         )
-                        .on_hover_text("Clique para zerar Rate (0,00)")
-                        .clicked()
-                    {
-                        doc.rate_slider = 0.0;
-                    }
-                    ui.add(
-                        egui::Slider::new(&mut doc.rate_slider, -12.0..=12.0)
-                            .show_value(false)
-                            .trailing_fill(false),
-                    )
-                    .on_hover_text("Controle de Rate / Pitch desta janela (-12 a +12 semitons)");
+                        .on_hover_text("Controle de Rate / Pitch desta janela (-12 a +12 semitons)");
 
-                    // Right-aligned 3 sunken status boxes (Start, End, Zoom Ratio — Screenshot 1!)
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let zoom_ratio = (doc.view_frames / wave_rect.width().max(1.0) as f64)
-                            .round()
-                            .max(1.0) as usize;
-                        draw_sunken_box(ui, &format!("1:{zoom_ratio}"), 64.0, &p);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Bottom-right corner resize handle (drag to resize height & width simultaneously!)
+                            if !is_maximized {
+                                let corner_resp = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("◢")
+                                            .size(12.0)
+                                            .color(p.text_muted),
+                                    )
+                                    .sense(Sense::drag()),
+                                );
+                                if corner_resp.hovered() || corner_resp.dragged() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe);
+                                }
+                                if corner_resp.dragged() {
+                                    let d = corner_resp.drag_delta();
+                                    doc.win_height = (doc.win_height + d.y).clamp(105.0, 720.0);
+                                    doc.win_width_ratio = (doc.win_width_ratio
+                                        + d.x / max_avail_w.max(300.0))
+                                    .clamp(0.35, 1.0);
+                                }
+                                corner_resp.on_hover_text(
+                                    "Arraste para redimensionar largura e altura da janela desta música",
+                                );
+                            }
 
-                        let (box1, box2) = if let Some((s, e)) = doc.selection {
-                            (
-                                format_timecode(doc.buffer.frame_to_secs(s)),
-                                format_timecode(doc.buffer.frame_to_secs(e)),
-                            )
-                        } else {
-                            (
-                                format_timecode(doc.buffer.frame_to_secs(doc.cursor_frame)),
-                                format_timecode(doc.buffer.duration_secs()),
-                            )
-                        };
-                        draw_sunken_box(ui, &box2, 86.0, &p);
-                        draw_sunken_box(ui, &box1, 86.0, &p);
+                            let zoom_ratio = (doc.view_frames / wave_rect.width().max(1.0) as f64)
+                                .round()
+                                .max(1.0) as usize;
+                            draw_sunken_box(ui, &format!("1:{zoom_ratio}"), 64.0, &p);
+
+                            let (box1, box2) = if let Some((s, e)) = doc.selection {
+                                (
+                                    format_timecode(doc.buffer.frame_to_secs(s)),
+                                    format_timecode(doc.buffer.frame_to_secs(e)),
+                                )
+                            } else {
+                                (
+                                    format_timecode(doc.buffer.frame_to_secs(doc.cursor_frame)),
+                                    format_timecode(doc.buffer.duration_secs()),
+                                )
+                            };
+                            draw_sunken_box(ui, &box2, 84.0, &p);
+                            draw_sunken_box(ui, &box1, 84.0, &p);
+                        });
                     });
                 });
-            });
+
+            // 4. Bottom horizontal drag bar to easily make window thinner/thicker!
+            if !is_maximized {
+                let (resize_rect, resize_resp) =
+                    ui.allocate_exact_size(Vec2::new(avail_w, 6.0), Sense::drag());
+                if resize_resp.hovered() || resize_resp.dragged() {
+                    ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+                    ui.painter().rect_filled(
+                        resize_rect,
+                        1.0,
+                        Color32::from_rgba_premultiplied(60, 130, 230, 120),
+                    );
+                }
+                if resize_resp.dragged() {
+                    doc.win_height =
+                        (doc.win_height + resize_resp.drag_delta().y).clamp(105.0, 720.0);
+                }
+                resize_resp.on_hover_text("Arraste para cima/baixo para deixar esta janela mais fina ou mais grossa");
+            }
+        });
     });
 
     action
@@ -702,7 +819,6 @@ fn draw_window_overview(
         }
     }
 
-    // Viewport thumb inside overview bar
     let vx0 = rect.min.x + (doc.view_start as f32 / total as f32) * rect.width();
     let vx1 = rect.min.x + ((doc.view_start + doc.view_frames) as f32 / total as f32) * rect.width();
     let thumb = Rect::from_min_max(
@@ -712,7 +828,6 @@ fn draw_window_overview(
     painter.rect_filled(thumb, 1.0, p.canvas_bg);
     painter.rect_stroke(thumb, 1.0, Stroke::new(1.0_f32, p.border));
 
-    // Cursor / playhead tick inside overview bar (like Screenshot 1!)
     let cur_f = playhead_frame.unwrap_or(doc.cursor_frame);
     let cx = rect.min.x + (cur_f as f32 / total as f32) * rect.width();
     painter.line_segment(
@@ -721,28 +836,111 @@ fn draw_window_overview(
     );
 }
 
-fn handle_waveform_interactions(
+/// Returns `Some(frame)` when the user clicked/selected a position that playback should jump to!
+fn handle_waveform_and_marker_interactions(
     ui: &Ui,
     response: &egui::Response,
     wave_rect: Rect,
+    marker_rect: Rect,
     ruler_rect: Rect,
     left_ch_rect: Rect,
     doc: &mut AudioDocument,
     interaction: &mut WaveformInteraction,
     snap_zero_crossing: bool,
     active_tool: ActiveTool,
-) {
+) -> Option<usize> {
     let total_frames = doc.buffer.num_frames();
     if total_frames == 0 {
-        return;
+        return None;
     }
     let view_start = doc.view_start;
     let view_frames = doc.view_frames.max(1.0);
+    let frame_to_x = |f: f64| -> f32 {
+        let ratio = ((f - view_start) / view_frames) as f32;
+        wave_rect.min.x + ratio * wave_rect.width()
+    };
     let x_to_frame = |x: f32| -> usize {
         let ratio = ((x - wave_rect.min.x) / wave_rect.width().max(1.0)).clamp(0.0, 1.0) as f64;
         let f = (view_start + ratio * view_frames).round() as usize;
         f.min(total_frames)
     };
+
+    // 1. Check if pointer is hovering or dragging a Marker Flag in `marker_rect` (or ruler)!
+    if let Some(hover_pos) = response.hover_pos() {
+        let in_marker_band = marker_rect.contains(hover_pos) || ruler_rect.contains(hover_pos);
+        if in_marker_band {
+            let near_marker = doc.annotations.markers.iter().any(|m| {
+                let mx = frame_to_x(m.frame as f64);
+                hover_pos.x >= mx - 4.0 && hover_pos.x <= mx + 18.0
+            });
+            if near_marker {
+                ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+            }
+        }
+    }
+
+    // Start dragging a marker if clicked inside marker_rect near a marker flag
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if marker_rect.contains(pos) || ruler_rect.contains(pos) {
+                if let Some(hit) = doc.annotations.markers.iter().find(|m| {
+                    let mx = frame_to_x(m.frame as f64);
+                    pos.x >= mx - 5.0 && pos.x <= mx + 18.0
+                }) {
+                    interaction.dragging_marker = Some((doc.id, hit.id));
+                    return None;
+                }
+            }
+        }
+    }
+
+    // Continue dragging marker left/right
+    if let Some((drag_doc, marker_id)) = interaction.dragging_marker {
+        if drag_doc == doc.id {
+            if response.dragged_by(egui::PointerButton::Primary) {
+                ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let mut new_f = x_to_frame(pos.x);
+                    if snap_zero_crossing {
+                        let search = (doc.buffer.sample_rate as usize / 80).max(32);
+                        new_f = doc.buffer.find_nearest_zero_crossing(new_f, search);
+                    }
+                    if let Some(m) = doc
+                        .annotations
+                        .markers
+                        .iter_mut()
+                        .find(|m| m.id == marker_id)
+                    {
+                        m.frame = new_f;
+                        doc.cursor_frame = new_f;
+                    }
+                }
+                return None;
+            }
+            if response.drag_stopped() {
+                doc.annotations.markers.sort_by_key(|m| m.frame);
+                interaction.dragging_marker = None;
+                return Some(doc.cursor_frame);
+            }
+        }
+    }
+
+    // Single-click on a marker flag jumps to that marker and plays from there!
+    if response.clicked_by(egui::PointerButton::Primary) {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if marker_rect.contains(pos) {
+                if let Some(hit) = doc.annotations.markers.iter().find(|m| {
+                    let mx = frame_to_x(m.frame as f64);
+                    pos.x >= mx - 5.0 && pos.x <= mx + 18.0
+                }) {
+                    let f = hit.frame;
+                    doc.cursor_frame = f;
+                    doc.selection = None;
+                    return Some(f);
+                }
+            }
+        }
+    }
 
     // Click on left channel badge `[1]` / `[2]` to toggle channel enable!
     if response.clicked_by(egui::PointerButton::Primary) {
@@ -753,7 +951,7 @@ fn handle_waveform_interactions(
                 if !doc.channel_enabled[0] && !doc.channel_enabled[1] {
                     doc.channel_enabled[1 - ch] = true;
                 }
-                return;
+                return None;
             }
         }
     }
@@ -787,7 +985,7 @@ fn handle_waveform_interactions(
         let pan_frames = -(dx as f64 / wave_rect.width().max(1.0) as f64) * view_frames;
         doc.view_start += pan_frames;
         doc.clamp_viewport();
-        return;
+        return None;
     }
 
     // Pencil Tool: draw directly on samples when zoomed in
@@ -822,8 +1020,10 @@ fn handle_waveform_interactions(
             doc.pyramid = crate::audio::WaveformPyramid::build(&doc.buffer);
             interaction.pencil_undo_pushed = false;
         }
-        return;
+        return None;
     }
+
+    let mut seek_target = None;
 
     // EditSelect or MagnifyZoom tool
     if response.drag_started_by(egui::PointerButton::Primary) {
@@ -868,6 +1068,8 @@ fn handle_waveform_interactions(
             } else {
                 doc.zoom_at(0.5, 0.5);
             }
+        } else {
+            seek_target = Some(doc.cursor_frame);
         }
         interaction.drag_doc_id = None;
         interaction.drag_anchor_frame = None;
@@ -878,7 +1080,7 @@ fn handle_waveform_interactions(
                     let anchor = ((pos.x - wave_rect.min.x) / wave_rect.width().max(1.0)) as f64;
                     let alt = ui.input(|i| i.modifiers.alt || i.modifiers.shift);
                     doc.zoom_at(if alt { 2.0 } else { 0.5 }, anchor);
-                    return;
+                    return None;
                 }
                 let mut f = x_to_frame(pos.x);
                 if snap_zero_crossing {
@@ -891,11 +1093,13 @@ fn handle_waveform_interactions(
                     if f != anchor {
                         let (s, e) = if anchor < f { (anchor, f) } else { (f, anchor) };
                         doc.selection = Some((s, e));
+                        doc.cursor_frame = s;
                     }
                 } else {
                     doc.cursor_frame = f;
                     doc.selection = None;
                 }
+                seek_target = Some(doc.cursor_frame);
             }
         }
     }
@@ -918,12 +1122,21 @@ fn handle_waveform_interactions(
                     .find(|m| m.frame > click_f)
                     .map(|m| m.frame);
                 match (prev_m, next_m) {
-                    (Some(a), Some(b)) if b > a => doc.selection = Some((a, b)),
-                    _ => doc.selection = Some((0, total_frames)),
+                    (Some(a), Some(b)) if b > a => {
+                        doc.selection = Some((a, b));
+                        doc.cursor_frame = a;
+                    }
+                    _ => {
+                        doc.selection = Some((0, total_frames));
+                        doc.cursor_frame = 0;
+                    }
                 }
+                seek_target = Some(doc.cursor_frame);
             }
         }
     }
+
+    seek_target
 }
 
 fn draw_time_ruler(
@@ -955,7 +1168,6 @@ fn draw_time_ruler(
     let mut t = first_tick;
     let ruler_painter = painter.with_clip_rect(rect);
 
-    // Minor ticks (5 subdivisions per major step)
     let sub_step = step / 5.0;
     let mut st = first_tick;
     while st <= end_secs + step * 0.1 {

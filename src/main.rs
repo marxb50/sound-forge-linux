@@ -18,7 +18,10 @@ use crate::dsp::{
     TimeStretchAlgorithm,
 };
 use crate::playback::PlaybackEngine;
-use crate::theme::{apply_forge_style, format_timecode, ForgeTheme, UiSkin};
+use crate::theme::{
+    apply_forge_style, format_timecode, format_timecode_dot, parse_timecode_secs, ForgeTheme,
+    UiSkin,
+};
 use crate::waveform_ui::{
     draw_sound_forge_doc_window, draw_vu_meter, ActiveTool, DocWindowAction, WaveformInteraction,
 };
@@ -113,9 +116,9 @@ struct ForgeApp {
     // Transport & Speed controls
     loop_enabled: bool,
     snap_zero_crossing: bool,
+    play_on_click: bool,
     playback_speed: f64,
     speed_mode: SpeedMode,
-    master_volume: f32,
 
     // Dialog states
     dialog: ActiveDialog,
@@ -220,9 +223,9 @@ impl ForgeApp {
             interaction: WaveformInteraction::default(),
             loop_enabled: false,
             snap_zero_crossing: true,
+            play_on_click: true,
             playback_speed: 1.0,
             speed_mode: SpeedMode::PreservePitch,
-            master_volume: 1.0,
             dialog: ActiveDialog::None,
             dlg_bypass: false,
             dlg_realtime: true,
@@ -420,10 +423,42 @@ impl ForgeApp {
 
     fn open_time_stretch_dialog(&mut self) {
         let init_secs = self.active_target_duration_secs();
-        self.dlg_ts_percent_of_orig = (100.0 / self.playback_speed.max(0.25)).clamp(25.0, 400.0);
+        self.dlg_ts_percent_of_orig = (100.0 / self.playback_speed.max(0.20)).clamp(50.0, 500.0);
         let final_secs = init_secs * (self.dlg_ts_percent_of_orig / 100.0);
-        self.dlg_ts_final_time_str = format_timecode(final_secs);
+        self.dlg_ts_final_time_str = format_timecode_dot(final_secs);
         self.dialog = ActiveDialog::TimeStretch;
+    }
+
+    /// Inserts a marker (`M`): if music is currently playing, drops the marker at the LIVE playhead position!
+    fn insert_marker_now(&mut self) {
+        if self.playback.is_playing() {
+            let live_pos = self.playback.current_source_frame();
+            let target_idx = self.playing_doc_idx.unwrap_or(self.active_tab);
+            if let Some(doc) = self.docs.get_mut(target_idx) {
+                let snapped = if self.snap_zero_crossing {
+                    doc.buffer.find_nearest_zero_crossing(live_pos, 128)
+                } else {
+                    live_pos
+                };
+                doc.cursor_frame = snapped;
+                doc.annotations.add_marker(snapped, None);
+                let count = doc.annotations.markers.len();
+                let secs = doc.buffer.frame_to_secs(snapped);
+                self.status_msg = format!(
+                    "Marcador #{count} inserido onde está tocando ({})!",
+                    format_timecode(secs)
+                );
+            }
+        } else if let Some(doc) = self.active_doc_mut() {
+            let pos = doc.cursor_frame;
+            doc.annotations.add_marker(pos, None);
+            let count = doc.annotations.markers.len();
+            let secs = doc.buffer.frame_to_secs(pos);
+            self.status_msg = format!(
+                "Marcador #{count} inserido no cursor ({}).",
+                format_timecode(secs)
+            );
+        }
     }
 
     fn active_target_duration_secs(&self) -> f64 {
@@ -666,10 +701,7 @@ impl ForgeApp {
             self.stop_playback();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::M)) && !ctrl {
-            if let Some(doc) = self.active_doc_mut() {
-                doc.annotations.add_marker(doc.cursor_frame, None);
-                self.status_msg = "Marcador inserido no cursor.".to_string();
-            }
+            self.insert_marker_now();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::R)) && !ctrl {
             if let Some(doc) = self.active_doc_mut() {
@@ -925,10 +957,11 @@ impl eframe::App for ForgeApp {
                 });
 
                 ui.menu_button("Insert", |ui| {
-                    if ui.button("Marker (M)").clicked() {
-                        if let Some(doc) = self.active_doc_mut() {
-                            doc.annotations.add_marker(doc.cursor_frame, None);
-                        }
+                    if ui
+                        .button("Marker (M) — Marca onde está tocando")
+                        .clicked()
+                    {
+                        self.insert_marker_now();
                         ui.close_menu();
                     }
                     if ui.button("Region (R)").clicked() {
@@ -1218,6 +1251,37 @@ impl eframe::App for ForgeApp {
                     }
                     if !self.docs.is_empty() {
                         ui.separator();
+                        if ui
+                            .button("↕ Deixar Todas as Janelas Finas (155 px)")
+                            .clicked()
+                        {
+                            for d in &mut self.docs {
+                                d.win_height = 155.0;
+                                d.minimized = false;
+                            }
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("↕ Altura Padrão nas Janelas (235 px)")
+                            .clicked()
+                        {
+                            for d in &mut self.docs {
+                                d.win_height = 235.0;
+                                d.minimized = false;
+                            }
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("↕ Deixar Todas as Janelas Grossas (330 px)")
+                            .clicked()
+                        {
+                            for d in &mut self.docs {
+                                d.win_height = 330.0;
+                                d.minimized = false;
+                            }
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         for (i, d) in self.docs.iter().enumerate() {
                             if ui
                                 .selectable_label(i == self.active_tab, format!("{}. {}", i + 1, d.title))
@@ -1401,6 +1465,15 @@ impl eframe::App for ForgeApp {
                         doc.cursor_frame = doc.buffer.num_frames();
                     }
                 }
+                if ui
+                    .button("📍 +M")
+                    .on_hover_text("Inserir Marcador (M) — Se estiver tocando, marca exatamente onde a música está tocando!")
+                    .clicked()
+                {
+                    self.insert_marker_now();
+                }
+                ui.toggle_value(&mut self.play_on_click, "▶ Tocar ao Clicar")
+                    .on_hover_text("Quando ativo, clicar na onda sonora ou em um marcador já inicia/pula a reprodução imediatamente daquele ponto");
 
                 ui.separator();
                 ui.label("Velocidade:");
@@ -1425,7 +1498,8 @@ impl eframe::App for ForgeApp {
                     {
                         self.playback_speed = preset;
                         if playing {
-                            self.play_doc(self.active_tab, false);
+                            self.playback
+                                .set_speed_live(self.playback_speed, self.speed_mode);
                         }
                     }
                 }
@@ -1438,11 +1512,13 @@ impl eframe::App for ForgeApp {
                         SpeedMode::Varispeed
                     };
                     if playing {
-                        self.play_doc(self.active_tab, false);
+                        self.playback
+                            .set_speed_live(self.playback_speed, self.speed_mode);
                     }
                 }
-                if speed_changed && playing && self.speed_mode == SpeedMode::Varispeed {
-                    self.play_doc(self.active_tab, false);
+                if speed_changed && playing {
+                    self.playback
+                        .set_speed_live(self.playback_speed, self.speed_mode);
                 }
 
                 if (self.playback_speed - 1.0).abs() > 0.005 {
@@ -1486,6 +1562,8 @@ impl eframe::App for ForgeApp {
 
         // Optional Left Dock: Regions / Markers List
         if self.show_markers_panel && !self.docs.is_empty() {
+            let mut add_live_marker = false;
+            let mut jump_and_play = None;
             egui::SidePanel::left("markers_panel")
                 .default_width(225.0)
                 .show(ctx, |ui| {
@@ -1494,7 +1572,7 @@ impl eframe::App for ForgeApp {
                     if let Some(doc) = self.active_doc_mut() {
                         ui.horizontal(|ui| {
                             if ui.button("+ Marcador (M)").clicked() {
-                                doc.annotations.add_marker(doc.cursor_frame, None);
+                                add_live_marker = true;
                             }
                             if ui.button("+ Região (R)").clicked() {
                                 if let Some((s, e)) = doc.selection {
@@ -1526,6 +1604,7 @@ impl eframe::App for ForgeApp {
                             }
                             if let Some(f) = jump_to {
                                 doc.cursor_frame = f;
+                                jump_and_play = Some(f);
                             }
                             if let Some(id) = remove_m {
                                 doc.annotations.remove_marker(id);
@@ -1533,6 +1612,16 @@ impl eframe::App for ForgeApp {
                         });
                     }
                 });
+            if add_live_marker {
+                self.insert_marker_now();
+            }
+            if let Some(f) = jump_and_play {
+                if self.playback.is_playing() && self.playing_doc_idx == Some(self.active_tab) {
+                    self.playback.seek_to_source_frame(f, None);
+                } else if self.play_on_click {
+                    self.play_doc(self.active_tab, true);
+                }
+            }
         }
 
         // Right Dock: Stereo VU Meter
@@ -1585,23 +1674,19 @@ impl eframe::App for ForgeApp {
 
                 match self.mdi_layout {
                     MdiLayoutMode::TileHorizontally => {
-                        let non_min = self.docs.iter().filter(|d| !d.minimized).count().max(1);
-                        let min_count = self.docs.iter().filter(|d| d.minimized).count();
-                        let usable_h = (avail_h - (min_count as f32 * 34.0) - (num_docs as f32 * 6.0)).max(150.0);
-                        let each_h = (usable_h / non_min as f32).max(165.0);
-
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for idx in 0..num_docs {
                                 let is_active = idx == self.active_tab;
                                 let is_playing_this = is_playing && self.playing_doc_idx == Some(idx);
                                 let pf = if is_playing_this { cur_play_frame } else { None };
+                                let prev_rate = self.docs[idx].rate_slider;
                                 let act = draw_sound_forge_doc_window(
                                     ui,
                                     &mut self.docs[idx],
                                     is_active,
                                     false,
                                     has_multi,
-                                    each_h,
+                                    None, // Uses each window's independent resizable `doc.win_height`!
                                     &mut self.interaction,
                                     pf,
                                     is_playing_this,
@@ -1610,6 +1695,18 @@ impl eframe::App for ForgeApp {
                                     self.active_tool,
                                     self.skin,
                                 );
+                                if is_playing_this
+                                    && (self.docs[idx].rate_slider - prev_rate).abs() > 0.005
+                                {
+                                    let rf = self.docs[idx].rate_to_speed_factor();
+                                    let spd = (self.playback_speed * rf).clamp(0.25, 4.0);
+                                    let mode = if self.docs[idx].rate_slider.abs() > 0.01 {
+                                        SpeedMode::Varispeed
+                                    } else {
+                                        self.speed_mode
+                                    };
+                                    self.playback.set_speed_live(spd, mode);
+                                }
                                 if act != DocWindowAction::None {
                                     pending_action = Some((idx, act));
                                 }
@@ -1630,7 +1727,7 @@ impl eframe::App for ForgeApp {
                                     is_active,
                                     false,
                                     has_multi,
-                                    avail_h - 8.0,
+                                    Some(avail_h - 8.0),
                                     &mut self.interaction,
                                     pf,
                                     is_playing_this,
@@ -1670,7 +1767,7 @@ impl eframe::App for ForgeApp {
                             true,
                             true,
                             has_multi,
-                            avail_h - 32.0,
+                            Some(avail_h - 32.0),
                             &mut self.interaction,
                             pf,
                             is_playing_this,
@@ -1689,6 +1786,27 @@ impl eframe::App for ForgeApp {
                     self.active_tab = idx;
                     match act {
                         DocWindowAction::Activate => {}
+                        DocWindowAction::SeekOrPlay(frame) => {
+                            let sel_end = self.docs.get(idx).and_then(|d| {
+                                d.selection.and_then(|(s, e)| {
+                                    if e > s + 2 && frame == s {
+                                        Some(e)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            });
+                            if self.playback.is_playing() && self.playing_doc_idx == Some(idx) {
+                                // Already playing this song -> jump immediately to the clicked position!
+                                self.playback.seek_to_source_frame(frame, sel_end);
+                            } else if self.playback.is_playing() || self.play_on_click {
+                                // Either another song was playing or `play_on_click` is enabled -> start playing here!
+                                if let Some(d) = self.docs.get_mut(idx) {
+                                    d.cursor_frame = frame;
+                                }
+                                self.play_doc(idx, sel_end.is_none());
+                            }
+                        }
                         DocWindowAction::PlayFrom(frame) => {
                             if let Some(d) = self.docs.get_mut(idx) {
                                 d.cursor_frame = frame;
@@ -1745,14 +1863,18 @@ impl ForgeApp {
         };
         let (s, e) = doc.target_range();
         let old_len = e - s;
+        let old_secs = doc.buffer.frame_to_secs(old_len);
         let next_buf = change_speed_range_with_algo(&doc.buffer, s, e, speed_factor, algo);
-        let new_len = next_buf.num_frames() - (doc.buffer.num_frames() - old_len);
+        let new_len = next_buf.num_frames().saturating_sub(doc.buffer.num_frames().saturating_sub(old_len));
+        let new_secs = next_buf.frame_to_secs(new_len);
         doc.annotations.adjust_for_edit(s, e, new_len);
         let new_sel = doc.selection.map(|_| (s, s + new_len));
         doc.commit_buffer(next_buf, s, new_sel);
         let pct_orig = 100.0 / speed_factor;
         self.status_msg = format!(
-            "Sony Time Stretch concluído: {:.2}% da duração original ({}).",
+            "Sony Time Stretch concluído: {} -> {} ({:.2}% do original • {}).",
+            format_timecode_dot(old_secs),
+            format_timecode_dot(new_secs),
             pct_orig,
             algo.label()
         );
@@ -1907,14 +2029,23 @@ impl ForgeApp {
                 }
             }
 
-            // Exact Screenshot 4: `Sony Time Stretch - <Song Title>`
+            // Exact Screenshot 4 & 6: `Sony Time Stretch - <Song Title>`
             ActiveDialog::TimeStretch => {
                 let mut open = true;
                 let init_secs = self.active_target_duration_secs();
+                let min_s = init_secs * 0.50;
+                let max_s = init_secs * 5.00;
+                if self.dlg_ts_final_time_str.is_empty() {
+                    self.dlg_ts_final_time_str =
+                        format_timecode_dot(init_secs * (self.dlg_ts_percent_of_orig / 100.0));
+                }
+
                 egui::Window::new(format!("Sony Time Stretch - {doc_title}"))
                     .open(&mut open)
                     .resizable(false)
                     .show(ctx, |ui| {
+                        let mut pct_changed = false;
+
                         ui.horizontal(|ui| {
                             ui.label("Preset:");
                             egui::ComboBox::from_id_salt("ts_preset")
@@ -1937,6 +2068,7 @@ impl ForgeApp {
                                         {
                                             self.dlg_ts_preset = name.to_string();
                                             self.dlg_ts_percent_of_orig = pct_orig;
+                                            pct_changed = true;
                                         }
                                     }
                                 });
@@ -1947,8 +2079,8 @@ impl ForgeApp {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.set_min_width(370.0);
-                                // Classic SONY | Time Stretch dark banner (Screenshot 4!)
+                                ui.set_min_width(385.0);
+                                // Classic SONY | Time Stretch dark banner (Screenshot 4 & 6!)
                                 egui::Frame::none()
                                     .fill(egui::Color32::from_rgb(128, 128, 128))
                                     .inner_margin(egui::Margin::symmetric(8.0, 4.0))
@@ -1975,57 +2107,140 @@ impl ForgeApp {
                                     ui.label("Mode:");
                                     egui::ComboBox::from_id_salt("ts_mode_combo")
                                         .selected_text(self.dlg_ts_algo.label())
-                                        .width(290.0)
+                                        .width(305.0)
                                         .show_ui(ui, |ui| {
                                             for &algo in TimeStretchAlgorithm::all() {
-                                                ui.selectable_value(
-                                                    &mut self.dlg_ts_algo,
-                                                    algo,
-                                                    algo.label(),
-                                                );
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.dlg_ts_algo,
+                                                        algo,
+                                                        algo.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    pct_changed = true;
+                                                }
                                             }
                                         });
                                 });
 
-                                let min_s = init_secs * 0.5;
-                                let max_s = init_secs * 5.0;
-                                let final_secs = init_secs * (self.dlg_ts_percent_of_orig / 100.0);
                                 ui.add_space(4.0);
+                                // Editable `Final Time` white box (matches `00:01:35.981` in Screenshot 6!)
                                 ui.horizontal(|ui| {
                                     ui.label(format!(
                                         "Final Time ({} to {}):",
-                                        format_timecode(min_s),
-                                        format_timecode(max_s)
+                                        format_timecode_dot(min_s),
+                                        format_timecode_dot(max_s)
                                     ));
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "[ {} ]",
-                                                    format_timecode(final_secs)
-                                                ))
-                                                .monospace()
-                                                .strong(),
+                                            let te = ui.add(
+                                                egui::TextEdit::singleline(
+                                                    &mut self.dlg_ts_final_time_str,
+                                                )
+                                                .desired_width(98.0)
+                                                .font(egui::TextStyle::Monospace),
                                             );
+                                            if te.changed() {
+                                                if let Some(parsed_s) =
+                                                    parse_timecode_secs(&self.dlg_ts_final_time_str)
+                                                {
+                                                    let clamped_s = parsed_s.clamp(min_s, max_s);
+                                                    self.dlg_ts_percent_of_orig = ((clamped_s
+                                                        / init_secs)
+                                                        * 100.0)
+                                                        .clamp(50.0, 500.0);
+                                                    if self.playback.is_playing()
+                                                        && self.dlg_realtime
+                                                    {
+                                                        let spd = (100.0
+                                                            / self
+                                                                .dlg_ts_percent_of_orig
+                                                                .max(20.0))
+                                                        .clamp(0.20, 4.0);
+                                                        let mode = if self.dlg_ts_algo
+                                                            == TimeStretchAlgorithm::VarispeedTape
+                                                        {
+                                                            SpeedMode::Varispeed
+                                                        } else {
+                                                            SpeedMode::PreservePitch
+                                                        };
+                                                        self.playback.set_speed_live(
+                                                            if self.dlg_bypass {
+                                                                1.0
+                                                            } else {
+                                                                spd
+                                                            },
+                                                            mode,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if te.lost_focus() {
+                                                let final_secs = init_secs
+                                                    * (self.dlg_ts_percent_of_orig / 100.0);
+                                                self.dlg_ts_final_time_str =
+                                                    format_timecode_dot(final_secs);
+                                            }
                                         },
                                     );
                                 });
 
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.dlg_ts_percent_of_orig,
-                                        50.0..=250.0,
+                                // Horizontal Time Stretch slider (50% to 500% of original time)
+                                if ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.dlg_ts_percent_of_orig,
+                                            50.0..=500.0,
+                                        )
+                                        .logarithmic(true)
+                                        .show_value(false),
                                     )
-                                    .show_value(false),
-                                );
+                                    .changed()
+                                {
+                                    pct_changed = true;
+                                }
+
+                                // Quick precision step buttons for exact tempo / time tuning
+                                ui.horizontal(|ui| {
+                                    for (lbl, delta_secs, delta_pct) in [
+                                        ("-5s", Some(-5.0), None),
+                                        ("-1s", Some(-1.0), None),
+                                        ("-1%", None, Some(-1.0)),
+                                        ("100%", None, Some(0.0)),
+                                        ("+1%", None, Some(1.0)),
+                                        ("+1s", Some(1.0), None),
+                                        ("+5s", Some(5.0), None),
+                                    ] {
+                                        if ui.small_button(lbl).clicked() {
+                                            if let Some(ds) = delta_secs {
+                                                let cur_s = init_secs
+                                                    * (self.dlg_ts_percent_of_orig / 100.0);
+                                                let next_s = (cur_s + ds).clamp(min_s, max_s);
+                                                self.dlg_ts_percent_of_orig =
+                                                    ((next_s / init_secs) * 100.0)
+                                                        .clamp(50.0, 500.0);
+                                            } else if let Some(dp) = delta_pct {
+                                                if dp == 0.0 {
+                                                    self.dlg_ts_percent_of_orig = 100.0;
+                                                } else {
+                                                    self.dlg_ts_percent_of_orig =
+                                                        (self.dlg_ts_percent_of_orig + dp)
+                                                            .clamp(50.0, 500.0);
+                                                }
+                                            }
+                                            pct_changed = true;
+                                        }
+                                    }
+                                });
 
                                 ui.separator();
                                 ui.horizontal(|ui| {
                                     ui.label("Input format:");
                                     egui::ComboBox::from_id_salt("ts_input_fmt")
                                         .selected_text(self.dlg_ts_format.label())
-                                        .width(180.0)
+                                        .width(185.0)
                                         .show_ui(ui, |ui| {
                                             for fmt in [
                                                 TimeStretchInputFormat::TimeHms,
@@ -2060,7 +2275,8 @@ impl ForgeApp {
                                             self.dlg_ts_percent_of_orig = ((self.dlg_ts_bpm_from
                                                 / self.dlg_ts_bpm_to)
                                                 * 100.0)
-                                                .clamp(50.0, 250.0);
+                                                .clamp(50.0, 500.0);
+                                            pct_changed = true;
                                         }
                                     });
                                 }
@@ -2070,12 +2286,12 @@ impl ForgeApp {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "[ {} ]",
-                                                    format_timecode(init_secs)
-                                                ))
-                                                .monospace(),
+                                            let mut init_str = format_timecode_dot(init_secs);
+                                            ui.add_enabled(
+                                                false,
+                                                egui::TextEdit::singleline(&mut init_str)
+                                                    .desired_width(98.0)
+                                                    .font(egui::TextStyle::Monospace),
                                             );
                                         },
                                     );
@@ -2086,20 +2302,32 @@ impl ForgeApp {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(
+                                                        &mut self.dlg_ts_percent_of_orig,
+                                                    )
+                                                    .speed(0.15)
+                                                    .range(50.0..=500.0)
+                                                    .fixed_decimals(2)
+                                                    .suffix(" %"),
+                                                )
+                                                .changed()
+                                            {
+                                                pct_changed = true;
+                                            }
                                             let speed_hint = if self.dlg_ts_percent_of_orig < 99.8 {
-                                                " (Acelerada)"
+                                                " (Mais rápida)"
                                             } else if self.dlg_ts_percent_of_orig > 100.2 {
-                                                " (Ralentada)"
+                                                " (Mais lenta)"
                                             } else {
                                                 ""
                                             };
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{:.2} %{speed_hint}",
-                                                    self.dlg_ts_percent_of_orig
-                                                ).replace('.', ","))
-                                                .strong(),
-                                            );
+                                            if !speed_hint.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(speed_hint).size(11.0),
+                                                );
+                                            }
                                         },
                                     );
                                 });
@@ -2107,8 +2335,25 @@ impl ForgeApp {
 
                             // Right column buttons (OK, Cancel, Preview, Bypass, Real-time, More...)
                             ui.vertical(|ui| {
-                                let speed_factor =
-                                    (100.0 / self.dlg_ts_percent_of_orig.max(25.0)).clamp(0.25, 4.0);
+                                let speed_factor = (100.0 / self.dlg_ts_percent_of_orig.max(20.0))
+                                    .clamp(0.20, 4.0);
+                                let preview_mode =
+                                    if self.dlg_ts_algo == TimeStretchAlgorithm::VarispeedTape {
+                                        SpeedMode::Varispeed
+                                    } else {
+                                        SpeedMode::PreservePitch
+                                    };
+
+                                if pct_changed {
+                                    let final_secs =
+                                        init_secs * (self.dlg_ts_percent_of_orig / 100.0);
+                                    self.dlg_ts_final_time_str = format_timecode_dot(final_secs);
+                                    if self.playback.is_playing() && self.dlg_realtime {
+                                        let spd = if self.dlg_bypass { 1.0 } else { speed_factor };
+                                        self.playback.set_speed_live(spd, preview_mode);
+                                    }
+                                }
+
                                 if ui
                                     .add_sized([92.0, 26.0], egui::Button::new("OK"))
                                     .clicked()
@@ -2125,25 +2370,43 @@ impl ForgeApp {
                                     self.dialog = ActiveDialog::None;
                                 }
                                 ui.add_space(6.0);
+                                let is_previewing = self.playback.is_playing();
+                                let preview_lbl = if is_previewing {
+                                    "■ Stop"
+                                } else {
+                                    "Preview"
+                                };
                                 if ui
-                                    .add_sized([92.0, 26.0], egui::Button::new("Preview"))
+                                    .add_sized([92.0, 26.0], egui::Button::new(preview_lbl))
                                     .clicked()
                                 {
-                                    if let Some(doc) = self.active_doc() {
-                                        let (s, e) = doc.target_range();
-                                        let seg = slice_frames(&doc.buffer, s, e);
+                                    if is_previewing {
+                                        self.stop_playback();
+                                    } else if let Some((buf, s, e)) = self
+                                        .active_doc()
+                                        .map(|d| {
+                                            let (s, e) = d.target_range();
+                                            (d.buffer.clone(), s, e)
+                                        })
+                                    {
                                         let spd = if self.dlg_bypass { 1.0 } else { speed_factor };
-                                        let proc = change_speed_range_with_algo(
-                                            &seg,
-                                            0,
-                                            seg.num_frames(),
+                                        self.playing_doc_idx = Some(self.active_tab);
+                                        self.playback.play_range(
+                                            buf,
+                                            s,
+                                            e,
+                                            self.loop_enabled,
                                             spd,
-                                            self.dlg_ts_algo,
+                                            preview_mode,
                                         );
-                                        self.preview_processed_buffer(proc);
                                     }
                                 }
-                                ui.checkbox(&mut self.dlg_bypass, "Bypass");
+                                if ui.checkbox(&mut self.dlg_bypass, "Bypass").changed()
+                                    && self.playback.is_playing()
+                                {
+                                    let spd = if self.dlg_bypass { 1.0 } else { speed_factor };
+                                    self.playback.set_speed_live(spd, preview_mode);
+                                }
                                 ui.checkbox(&mut self.dlg_realtime, "Real-time");
                                 ui.add_space(32.0);
                                 let _ = ui.add_sized([92.0, 24.0], egui::Button::new("More..."));
@@ -2154,6 +2417,7 @@ impl ForgeApp {
                         self.draw_dialog_time_boxes(ui);
                     });
                 if !open {
+                    self.stop_playback();
                     self.dialog = ActiveDialog::None;
                 }
             }

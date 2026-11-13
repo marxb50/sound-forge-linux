@@ -1025,7 +1025,9 @@ pub fn time_stretch_wsola_window(
         let mut best_ana = nominal_ana.min(n - win_len);
         let mut best_score = f32::NEG_INFINITY;
 
-        let cmp_len = syn_hop.min(n.saturating_sub(ref_start));
+        let cmp_len = syn_hop.min(n.saturating_sub(ref_start)).min(1024);
+        // Stage 1: Fast coarse search
+        let mut coarse_best = best_ana;
         let mut cand = min_cand;
         while cand <= max_cand {
             let mut dot = 0.0_f32;
@@ -1038,14 +1040,38 @@ pub fn time_stretch_wsola_window(
                 dot += r * x;
                 e_ref += r * r;
                 e_cand += x * x;
+                i += 4;
+            }
+            let score = dot / (e_ref * e_cand).sqrt();
+            if score > best_score {
+                best_score = score;
+                coarse_best = cand;
+            }
+            cand += 8;
+        }
+
+        // Stage 2: Fine single-sample refinement around coarse_best
+        let fine_min = coarse_best.saturating_sub(8).max(min_cand);
+        let fine_max = (coarse_best + 8).min(max_cand);
+        best_score = f32::NEG_INFINITY;
+        for f_cand in fine_min..=fine_max {
+            let mut dot = 0.0_f32;
+            let mut e_ref = 1e-9_f32;
+            let mut e_cand = 1e-9_f32;
+            let mut i = 0;
+            while i < cmp_len {
+                let r = mono[ref_start + i];
+                let x = mono[f_cand + i];
+                dot += r * x;
+                e_ref += r * r;
+                e_cand += x * x;
                 i += 2;
             }
             let score = dot / (e_ref * e_cand).sqrt();
             if score > best_score {
                 best_score = score;
-                best_ana = cand;
+                best_ana = f_cand;
             }
-            cand += 2;
         }
 
         if out_pos + win_len >= norm.len() {

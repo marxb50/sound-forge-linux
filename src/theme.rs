@@ -178,10 +178,59 @@ pub fn format_ruler_time(secs: f64) -> String {
     }
 }
 
+pub fn format_timecode_dot(secs: f64) -> String {
+    let secs = secs.max(0.0);
+    let total_ms = (secs * 1000.0).round() as u64;
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    let s = total_s % 60;
+    let m = (total_s / 60) % 60;
+    let h = total_s / 3600;
+    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+/// Parses `HH:MM:SS.mmm`, `MM:SS.mmm`, `HH:MM:SS,mmm`, or raw seconds `95.981` into seconds.
+pub fn parse_timecode_secs(input: &str) -> Option<f64> {
+    let clean = input.trim().replace(',', ".");
+    if clean.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = clean.split(':').collect();
+    match parts.len() {
+        1 => parts[0].parse::<f64>().ok().filter(|&v| v > 0.0),
+        2 => {
+            let m = parts[0].parse::<f64>().ok()?;
+            let s = parts[1].parse::<f64>().ok()?;
+            Some(m * 60.0 + s).filter(|&v| v > 0.0)
+        }
+        3 => {
+            let h = parts[0].parse::<f64>().ok()?;
+            let m = parts[1].parse::<f64>().ok()?;
+            let s = parts[2].parse::<f64>().ok()?;
+            Some(h * 3600.0 + m * 60.0 + s).filter(|&v| v > 0.0)
+        }
+        _ => None,
+    }
+}
+
 pub fn amp_to_db(amp: f32) -> f32 {
     if amp <= 1e-6 {
         -96.0
     } else {
         20.0 * amp.log10()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_timecode_secs() {
+        let s1 = parse_timecode_secs("00:01:35.981").unwrap();
+        assert!((s1 - 95.981).abs() < 1e-4);
+
+        let s2 = parse_timecode_secs("01:46,824").unwrap();
+        assert!((s2 - 106.824).abs() < 1e-4);
     }
 }

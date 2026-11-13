@@ -31,6 +31,12 @@ pub struct AudioDocument {
     pub channel_enabled: [bool; 2],
     /// Whether this MDI window is collapsed/minimized when stacked.
     pub minimized: bool,
+    /// Individual MDI window height in pixels (can be dragged thin ~115px or thick ~680px!).
+    pub win_height: f32,
+    /// Individual MDI window width ratio (0.35 .. 1.00 of workspace width).
+    pub win_width_ratio: f32,
+    /// Vertical waveform amplitude zoom (0.25x thinner .. 4.0x thicker).
+    pub amp_zoom: f32,
 }
 
 impl AudioDocument {
@@ -59,6 +65,9 @@ impl AudioDocument {
             rate_slider: 0.0,
             channel_enabled: [true, true],
             minimized: false,
+            win_height: 235.0,
+            win_width_ratio: 0.98,
+            amp_zoom: 1.0,
         }
     }
 
